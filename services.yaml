@@ -1,0 +1,271 @@
+# ESP HA Core Services
+# Sensor threshold management core services
+
+# IMU gesture control services
+enable_imu_gesture:
+  name: "Enable IMU Gesture Detection"
+  description: "Enable IMU gesture detection for the specified ESP device"
+  fields:
+    entity_id:
+      name: "Entity ID"
+      description: "要启用的IMU手势传感器Entity ID"
+      required: true
+      selector:
+        entity:
+          domain: sensor
+
+disable_imu_gesture:
+  name: "Disable IMU Gesture Detection"
+  description: "Disable IMU gesture detection for the specified ESP device"
+  fields:
+    entity_id:
+      name: "Entity ID"
+      description: "要禁用的IMU手势传感器Entity ID"
+      required: true
+      selector:
+        entity:
+          domain: sensor
+
+set_sensor_threshold:
+  name: Set Sensor Threshold
+  description: Set sensor threshold alarm and sync to ESP32 device
+  target:
+    entity:
+      domain: sensor
+  fields:
+    entity_id:
+      name: Entity ID
+      description: 传感器Entity ID
+      required: true
+      example: "sensor.esp_ha_aabbccddeeff_discovered_temperature"
+      selector:
+        entity:
+          domain: sensor
+    min_threshold:
+      name: Minimum Threshold
+      description: Minimum threshold (alarm triggered below this value)
+      required: false
+      example: 10.0
+      selector:
+        number:
+          min: -100
+          max: 100
+          step: 0.1
+    max_threshold:
+      name: Maximum Threshold
+      description: Maximum threshold (alarm triggered above this value)
+      required: false
+      example: 35.0
+      selector:
+        number:
+          min: -100
+          max: 100
+          step: 0.1
+    alarm_enabled:
+      name: Enable Alarm
+      description: Whether to enable threshold alarm
+      required: false
+      default: true
+      selector:
+        boolean:
+    sync_to_esp32:
+      name: Sync to ESP32
+      description: Whether to sync threshold settings to ESP32 device
+      required: false
+      default: true
+      selector:
+        boolean:
+
+get_sensor_threshold:
+  name: Get Sensor Threshold
+  description: Get sensor threshold configuration
+  target:
+    entity:
+      domain: sensor
+  fields:
+    entity_id:
+      name: Entity ID
+      description: 传感器Entity ID
+      required: true
+      example: "sensor.esp_ha_aabbccddeeff_discovered_temperature"
+      selector:
+        entity:
+          domain: sensor
+
+sync_thresholds_to_esp32:
+  name: Sync Thresholds to ESP32
+  description: Sync all threshold configurations to ESP32 device
+  target:
+  fields: {}
+
+get_sensors_summary:
+  name: Get Sensors Summary
+  description: Get status summary of all ESP HA sensors
+  target:
+  fields: {}
+
+# ESP32 Advanced Threshold Services
+process_esp32_threshold_report:
+  name: Process ESP32 Threshold Report
+  description: Process ESP32 threshold report service and automatically create/update helpers
+  target:
+  fields:
+    node_id:
+      name: Device Node ID
+      description: ESP32 device node ID
+      required: true
+      example: "eylcoptfim5h88w9tcebgo"
+      selector:
+        text:
+    threshold_data:
+      name: Threshold Data
+      description: Threshold data object
+      required: true
+      example: {"temperature_min_threshold": 15.0, "temperature_max_threshold": 35.0}
+      selector:
+        object:
+
+process_esp32_alarm:
+  name: Process ESP32 Alarm
+  description: Process ESP32 alarm message service
+  target:
+  fields:
+    node_id:
+      name: Device Node ID
+      description: ESP32 device node ID
+      required: true
+      example: "eylcoptfim5h88w9tcebgo"
+      selector:
+        text:
+    alarm_message:
+      name: Alarm Message
+      description: Alarm message content
+      required: true
+      example: "ALARM|Temperature|15|35|40|HIGH|30|current_value:25.0"
+      selector:
+        text:
+
+get_sensor_history:
+  name: Get Sensor History
+  description: Get sensor short-term historical data
+  target:
+    entity:
+      domain: sensor
+  fields:
+    entity_id:
+      name: Entity ID
+      description: 传感器Entity ID
+      required: true
+      example: "sensor.esp_ha_aabbccddeeff_discovered_temperature"
+      selector:
+        entity:
+          domain: sensor
+    duration_minutes:
+      name: Duration (Minutes)
+      description: How many minutes of historical data to retrieve
+      required: false
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+
+clear_sensor_history:
+  name: Clear Sensor History
+  description: Clear sensor history cache
+  target:
+  fields:
+    entity_id:
+      name: Entity ID
+      description: 传感器Entity ID（可选，不指定则清除所有）
+      required: false
+      example: "sensor.esp_ha_aabbccddeeff_discovered_temperature"
+      selector:
+        entity:
+          domain: sensor
+
+update_sensor_threshold_attributes:
+  name: Update Sensor Threshold Attributes
+  description: Service to update sensor threshold attributes - now managed through helpers
+  target:
+    entity:
+      domain: sensor
+  fields:
+    entity_id:
+      name: Entity ID
+      description: 传感器Entity ID
+      required: true
+      example: "sensor.esp_ha_aabbccddeeff_discovered_temperature"
+      selector:
+        entity:
+          domain: sensor
+
+test_threshold_alert:
+  name: Test Threshold Alert
+  description: Test threshold alarm notification system
+  target:
+  fields:
+    sensor_type:
+      name: Sensor Type
+      description: Sensor type
+      required: false
+      default: "temperature"
+      example: "temperature"
+      selector:
+        select:
+          options:
+            - temperature
+            - humidity
+            - pressure
+            - illuminance
+            - co2
+            - voc
+            - pm25
+    alert_type:
+      name: Alert Type
+      description: Alarm type
+      required: false
+      default: "high"
+      selector:
+        select:
+          options:
+            - high
+            - low
+    current_value:
+      name: Current Value
+      description: Current sensor value
+      required: false
+      default: 30.0
+      selector:
+        number:
+          min: -100
+          max: 10000
+          step: 0.1
+    threshold_value:
+      name: Threshold Value
+      description: Threshold
+      required: false
+      default: 25.0
+      selector:
+        number:
+          min: -100
+          max: 10000
+          step: 0.1
+    unit:
+      name: Unit
+      description: Unit
+      required: false
+      default: "°C"
+      example: "°C"
+      selector:
+        text:
+    device_name:
+      name: Device Name
+      description: Device name
+      required: false
+      default: "ESP32"
+      example: "ESP32"
+      selector:
+        text:
+

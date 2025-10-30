@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "ESP device discovery",
+        "description": "Searching for ESP devices on your network..."
+      },
+      "pop_input": {
+        "title": "Security authentication required",
+        "description": "Device \"{device_name}\" (ID: {device_id}) at {device_ip} requires a PoP (Proof of Possession) value.\n\nCommon PoP values:\n• Device MAC address\n• Custom password from device setup\n• Default values like 'abcd1234' or 'esp32'\n\nCheck your device documentation if unsure.",
+        "data": {
+          "custom_pop": "PoP (Proof of Possession)"
+        },
+        "data_description": {
+          "custom_pop": "Enter the PoP authentication code set during device configuration."
+        }
+      },
+      "device_setup": {
+        "title": "Select device",
+        "description": "Found {device_count} ESP device(s). Select one to add.\n\nDevice information:\n• Name and node ID\n• Security level (0 = no auth, 1 = requires PoP)\n\nYou can add additional devices later.",
+        "data": {
+          "selected_device": "Device"
+        },
+        "data_description": {
+          "selected_device": "Select the ESP device to add. You'll be prompted for PoP if required."
+        }
+      }
+    },
+    "error": {
+      "no_devices_selected": "Please select a device.",
+      "pop_required": "PoP value required for device {device_name} ({device_id}).",
+      "invalid_pop": "Invalid PoP value for device {device_name} ({device_id}).",
+      "unknown": "Unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "Device already configured.",
+      "no_devices_found": "No devices found.",
+      "no_node_id": "Device does not have a valid node ID.",
+      "device_added_successfully": "Successfully added {device_name}."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Device options",
+        "description": "Configure options for your ESP device",
+        "data": {
+          "custom_pop": "Custom PoP (optional)"
+        }
+      }
+    }
+  }
+}

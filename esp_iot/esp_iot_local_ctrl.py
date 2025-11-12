@@ -87,6 +87,9 @@ class ESPLocalCtrlClient:
         self._control_lock: asyncio.Lock = asyncio.Lock()
         self._last_successful_call: float = 0
         self._connection_attempts: int = 0
+        
+        # Connection error tracking for immediate detection of RST/connection loss
+        self._connection_error: bool = False
 
         # HTTP Message Listener for receiving active reports and responses
         self._http_listener: HTTPMessageListener | None = None
@@ -193,6 +196,9 @@ class ESPLocalCtrlClient:
 
             self.session_established = True
             self._last_successful_call = time.time()
+            
+            # Clear connection error flag on successful connect
+            self._connection_error = False
 
             # Enable TCP keepalive for automatic connection monitoring
             # This allows the kernel to detect broken connections automatically
@@ -202,6 +208,8 @@ class ESPLocalCtrlClient:
             # This prevents race condition where ESP32 sends message
             # before callback is registered
             await self._start_message_listener()
+
+            _LOGGER.info("Connection established successfully for %s", self.node_id)
 
         except Exception:  # Broad exception acceptable for connection cleanup
             _LOGGER.exception("Connection failed for device %s", self.node_id)
@@ -219,6 +227,14 @@ class ESPLocalCtrlClient:
         Returns:
             True if connection is valid, False otherwise.
         """
+        # Check connection error flag first (set by listener when RST detected)
+        if self._connection_error:
+            _LOGGER.debug(
+                "is_connected() returning False: connection error flag set for device %s",
+                self.node_id,
+            )
+            return False
+
         if not self.transport or not self.session_established:
             return False
 
@@ -240,7 +256,7 @@ class ESPLocalCtrlClient:
                         _LOGGER.info("Socket fileno is -1 for device %s - connection lost", self.node_id)
                         return False
                     
-                    # 🔍 Connection health check using multiple methods
+                    # Connection health check using multiple methods
                     # TCP keepalive automatically detects broken connections in background
                     # Parameters: idle=10s, interval=5s, count=3
                     # Total detection time: 10-25 seconds maximum
@@ -323,6 +339,30 @@ class ESPLocalCtrlClient:
         """
         return self.security_config
 
+    async def _ensure_connected(self) -> bool:
+        """Ensure device is connected, reconnect if necessary.
+        
+        This method checks the connection state and attempts to reconnect
+        if the connection is broken or not established.
+        
+        Returns:
+            True if connected (or reconnected successfully), False otherwise.
+        """
+        # Check connection error flag FIRST - if set, force reconnection
+        if self._connection_error:
+            _LOGGER.warning(
+                "Connection error detected, forcing reconnection for device %s",
+                self.node_id
+            )
+            await self._cleanup_session()  # Stop listener and clean up
+            return await self.connect()
+        
+        # Check if we need to establish initial connection
+        if not self.transport or not self.session_established:
+            return await self.connect()
+        
+        return True
+
     async def get_property_count(self) -> int:
         """Get the number of properties available on the device.
 
@@ -331,11 +371,11 @@ class ESPLocalCtrlClient:
         """
         async with self._control_lock:
             try:
-                if not self.transport or not self.session_established:
-                    if not await self.connect():
-                        return 0
+                # Use unified connection check
+                if not await self._ensure_connected():
+                    return 0
 
-                # ✅ Query property count using HTTPMessageListener
+                # Query property count using HTTPMessageListener
                 if not self._http_listener:
                     _LOGGER.warning("Listener not available for property count query")
                     return 0
@@ -378,9 +418,9 @@ class ESPLocalCtrlClient:
         """
         async with self._control_lock:
             try:
-                if not self.transport or not self.session_established:
-                    if not await self.connect():
-                        return []
+                # Use unified connection check
+                if not await self._ensure_connected():
+                    return []
 
                 # Use direct query instead of listener (listener not available)
                 # Return empty for now - monitoring loop will keep trying
@@ -507,10 +547,23 @@ class ESPLocalCtrlClient:
                     "Setting properties: indices=%s, values=%s", indices, values
                 )
 
+                # Check connection error flag FIRST - if set, return False to trigger full reconnect
+                # Don't reconnect internally - let upper layer (_fast_reconnect_for_manual_operation) handle it
+                # This ensures all entities get updated via get_property_values after reconnection
+                if self._connection_error:
+                    _LOGGER.warning(
+                        "Connection error detected for device %s, returning False to trigger full reconnect with property sync",
+                        self.node_id
+                    )
+                    return False
+                
+                # Also check if transport/session is missing - return False to trigger full reconnect
                 if not self.transport or not self.session_established:
-                    _LOGGER.debug("No transport or session, attempting to connect...")
-                    if not await self.connect():
-                        return False
+                    _LOGGER.warning(
+                        "No transport or session for device %s, returning False to trigger full reconnect",
+                        self.node_id
+                    )
+                    return False
 
                 # Convert values to ESP-IDF byte format using utility function
                 esp_values = convert_values_to_esp_format(values)
@@ -519,16 +572,33 @@ class ESPLocalCtrlClient:
                 if indices and indices[0] == CONFIG_PROPERTY_INDEX:
                     indices = [PARAMS_PROPERTY_INDEX]
 
-                # Use ESP-IDF function directly
-                success = await esp_local_ctrl.set_property_values(
-                    self.transport,
-                    self.security_ctx,
-                    props=None,  # We don't need property definitions for basic setting
-                    indices=indices,
-                    values=esp_values,
-                    check_readonly=False,
-                    listener=self._http_listener,  # Use unified async flow
-                )
+                # Check error flag one more time before sending
+                # (in case listener detected error between initial check and now)
+                if self._connection_error:
+                    _LOGGER.warning("Connection error detected before send, aborting operation for device %s", self.node_id)
+                    return False
+
+                # Use ESP-IDF function directly with timeout to detect hanging operations
+                try:
+                    success = await asyncio.wait_for(
+                        esp_local_ctrl.set_property_values(
+                            self.transport,
+                            self.security_ctx,
+                            props=None,  # We don't need property definitions for basic setting
+                            indices=indices,
+                            values=esp_values,
+                            check_readonly=False,
+                            listener=self._http_listener,  # Use unified async flow
+                        ),
+                        timeout=5.0  # 5 second timeout for operation
+                    )
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "Property setting timed out for device %s (possible RST/disconnect)",
+                        self.node_id
+                    )
+                    self.mark_connection_error()
+                    return False
 
                 if not success:
                     _LOGGER.warning("ESP32 rejected property setting request")
@@ -537,6 +607,8 @@ class ESPLocalCtrlClient:
 
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("Failed to set property values: %s", err)
+                # Mark connection as errored on failure to trigger reconnection
+                self.mark_connection_error()
                 return False
 
     async def disconnect(self) -> None:
@@ -545,6 +617,10 @@ class ESPLocalCtrlClient:
         Cleans up transport and security context, and resets session state.
         """
         _LOGGER.debug("Disconnecting from device %s", self.node_id)
+        
+        # Set connection error flag to prevent reuse of closed connection
+        self._connection_error = True
+        
         await self._cleanup_session()
 
     async def _cleanup_session(self) -> None:
@@ -560,10 +636,14 @@ class ESPLocalCtrlClient:
             with contextlib.suppress(Exception):
                 if hasattr(self.transport, "close"):
                     self.transport.close()
+                    # Wait for connection to actually close (TCP FIN/ACK sequence)
+                    # This prevents old socket from retransmitting while new connection establishes
+                    await asyncio.sleep(0.1)
                 # Fallback: try to close conn directly
                 elif hasattr(self.transport, "conn"):
                     with contextlib.suppress(Exception):
                         self.transport.conn.close()
+                        await asyncio.sleep(0.1)
 
             self.transport = None
 
@@ -638,7 +718,7 @@ class ESPLocalCtrlClient:
 
             # Create listener
             self._http_listener = HTTPMessageListener(
-                self.transport, self.security_ctx, verbose=False
+                self.transport, self.security_ctx, client=self, verbose=False
             )
 
             # Add all pre-registered callbacks BEFORE starting listener
@@ -670,6 +750,19 @@ class ESPLocalCtrlClient:
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Error stopping HTTP message listener: %s", err)
             self._http_listener = None
+
+    def mark_connection_error(self) -> None:
+        """Mark connection as having an error (for external error detection).
+
+        This method can be called by any code that detects connection issues
+        (e.g., timeout, socket error, listener failure) to flag that the
+        connection should be considered dead.
+        """
+        self._connection_error = True
+        _LOGGER.warning(
+            "Connection error detected for device %s - will trigger reconnect on next operation",
+            self.node_id,
+        )
 
     def add_message_callback(self, callback: callable) -> None:
         """Register a callback to be invoked when HTTP messages are received.

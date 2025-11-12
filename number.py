@@ -30,7 +30,6 @@ from .esp_iot import (
 
 _LOGGER = logging.getLogger(__name__)
 
-
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -66,7 +65,6 @@ async def async_setup_entry(
             event_data = event.data
             event_node_id = event_data.get("node_id", "").replace(":", "").lower()
 
-            # ✅ 关键过滤：只处理属于当前config entry管理的设备
             if event_node_id != node_id.lower():
                 _LOGGER.debug(
                     "Battery parameter discovery event for different device (%s != %s), ignoring",
@@ -171,7 +169,6 @@ async def async_setup_entry(
                             discovered_entities[entity_key] = battery_sampling_entity
                             new_entities = [battery_sampling_entity]
                             async_add_entities(new_entities)
-                            _LOGGER.info("已创建电池采样间隔数字实体: %s", entity_key)
 
         except Exception:
             _LOGGER.exception("Failed to handle number platform discovery event")
@@ -189,27 +186,30 @@ async def async_setup_entry(
             )
 
             if not event_node_id:
-                _LOGGER.error("❌ 传感器发现事件缺少node_id和mac")
+                _LOGGER.error("Sensor discovery event missing node_id and mac")
                 return
 
-            # ✅ 关键过滤：只处理属于当前config entry管理的设备
-            if event_node_id.lower() != node_id.lower():
+            # Normalize node_id before comparison
+            event_node_id = str(event_node_id).replace(":", "").strip().lower()
+
+            # Filter: only process devices managed by this config entry
+            if event_node_id != node_id.lower():
                 _LOGGER.debug(
-                    "传感器发现事件不属于当前config entry管理的设备 (%s != %s), 跳过",
-                    event_node_id.lower(),
+                    "Sensor discovery event for different device (%s != %s), skipping",
+                    event_node_id,
                     node_id.lower(),
                 )
                 return
 
-            # 使用事件中的node_id，不要重新赋值以避免变量遮蔽
-            processed_node_id = str(event_node_id).replace(":", "").strip().lower()
+            # 使用事件中的node_id (already normalized)
+            processed_node_id = event_node_id
             raw_type = event.data.get("raw_type", "")  # 优先使用原始类型
             sensor_type = raw_type or event.data.get(
                 "sensor_type", ""
             )  # 如果没有原始类型则使用 sensor_type
 
             if not sensor_type:
-                _LOGGER.error("❌ 传感器发现事件缺少sensor_type")
+                _LOGGER.error("Sensor discovery event missing sensor_type")
                 return
 
             sensor_name = event.data.get("sensor_name", "") or event.data.get(
@@ -226,10 +226,10 @@ async def async_setup_entry(
 
             # Check API availability before proceeding
             if not api:
-                _LOGGER.error("❌ API实例为None，无法创建Number实体")
+                _LOGGER.error("API instance is None, cannot create Number entity")
                 return
 
-            _LOGGER.debug("📡 API实例可用，开始创建Number实体: %s", type(api).__name__)
+            _LOGGER.debug("API instance available, creating Number entity: %s", type(api).__name__)
 
             # Create min and max threshold number entities
             new_entities = []
@@ -262,7 +262,7 @@ async def async_setup_entry(
                     # Check if API is available
                     if not api:
                         _LOGGER.error(
-                            "❌ API实例不可用，无法创建阈值数字实体: %s", entity_key
+                            "API instance unavailable, cannot create threshold number entity: %s", entity_key
                         )
                         continue
 
@@ -336,7 +336,7 @@ async def async_setup_entry(
                     if not entity_node_id or not sensor_type:
                         continue
 
-                    # ✅ Per-device cache already filtered, but double-check for safety
+                    # Per-device cache already filtered, but double-check for safety
                     if str(entity_node_id).replace(":", "").lower() != node_id.lower():
                         continue
                     # 仅为需要阈值的类型创建
@@ -372,57 +372,9 @@ async def async_setup_entry(
     except Exception:
         _LOGGER.exception("Failed to replay discovered sensors")
 
-    # Listen for ESP32 threshold report events to initialize number entity values
-    async def handle_esp32_threshold_report(event):
-        """Handle ESP32 threshold report event to initialize number entity values."""
-        try:
-            event_node_id = event.data.get("node_id", "").lower()
-
-            # ✅ 关键过滤：只处理属于当前config entry管理的设备
-            if event_node_id != node_id.lower():
-                _LOGGER.debug(
-                    "ESP32阈值上报事件不属于当前config entry管理的设备 (%s != %s), 跳过",
-                    event_node_id,
-                    node_id.lower(),
-                )
-                return
-
-            threshold_data = event.data.get("threshold_data", {})
-
-            # 解析阈值数据并更新对应的数字实体
-            for param_name, value in threshold_data.items():
-                try:
-                    # 解析参数名格式: sensor_type_min_threshold 或 sensor_type_max_threshold
-                    if param_name.endswith("_min_threshold"):
-                        sensor_type = param_name.replace("_min_threshold", "")
-                        threshold_type = "min"
-                    elif param_name.endswith("_max_threshold"):
-                        sensor_type = param_name.replace("_max_threshold", "")
-                        threshold_type = "max"
-                    else:
-                        continue  # 跳过非阈值参数
-
-                    entity_key = f"{node_id}_{sensor_type}_{threshold_type}_threshold"
-
-                    if entity_key in discovered_entities:
-                        threshold_entity = discovered_entities[entity_key]
-                        # 更新数字实体的值（从ESP32上报的值初始化）
-                        await threshold_entity.async_set_esp32_value(float(value))
-                    else:
-                        _LOGGER.debug("未找到对应的阈值数字实体: %s", entity_key)
-
-                except (ValueError, TypeError) as e:
-                    _LOGGER.error(
-                        "Failed to parse threshold parameter: %s = %s, error: %s", param_name, value, e
-                    )
-
-        except Exception:
-            _LOGGER.exception("Failed to handle ESP32 threshold report event")
-
-    # Register ESP32 threshold report event listener
-    hass.bus.async_listen(
-        f"{DOMAIN}_threshold_data_received", handle_esp32_threshold_report
-    )
+    # Note: ESP32 threshold data updates are now handled by each threshold entity
+    # in their async_added_to_hass() method. No global listener needed to avoid
+    # duplicate event processing (previously caused 15 handlers per event).
 
     # Register service: manually sync all thresholds to ESP32
     if not hass.services.has_service(DOMAIN, "sync_all_thresholds_to_esp32"):
@@ -479,9 +431,8 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
-    # ✅ 返回True表示平台设置成功
+    # Return True to indicate platform setup success
     return True
-
 
 class ESPHomeThresholdNumber(NumberEntity):
     """ESP HA threshold number entity."""
@@ -650,24 +601,20 @@ class ESPHomeThresholdNumber(NumberEntity):
         try:
             node_id = self._device_info["node_id"].lower()
 
-            # 🔧 使用utility函数生成ESP32期望的参数名
             param_name = get_esp32_threshold_param_name(self._sensor_type, self._threshold_type)
             value = self._attr_native_value
 
-            # 🚀 使用阈值同步事件路径: {DOMAIN}_sync_single_threshold
-            # 这样确保使用正确的ESP32通信机制
             self.hass.bus.async_fire(
                 f"{DOMAIN}_sync_single_threshold",
                 {
                     "sensor_type": self._sensor_type,
                     "param_name": param_name,
                     "value": value,
-                    "number_entity_id": self.entity_id,  # 用于跟踪来源
+                    "number_entity_id": self.entity_id,
                     "source": "number_entity",
                 },
             )
 
-            # 🔄 同时保持原有事件用于向后兼容（如果其他地方需要）
             self.hass.bus.async_fire(
                 f"{DOMAIN}_threshold_update_to_esp32",
                 {
@@ -691,12 +638,28 @@ class ESPHomeThresholdNumber(NumberEntity):
     async def async_set_esp32_value(self, value: float) -> None:
         """Set value from ESP32 without triggering callback to ESP32."""
         try:
-            # Only update local value, don't send back to ESP32
+            old_value = self._attr_native_value
+            value_changed = old_value != value
+
+            # Update value and sync time
             self._attr_native_value = value
             self._last_esp32_sync = datetime.datetime.now()
 
-            # Update state
+            # Always write state to update last_updated timestamp
+            # This is important for reconnection scenarios where the value
+            # hasn't changed but we still want to show the entity is in sync
             self.async_write_ha_state()
+
+            if value_changed:
+                _LOGGER.info(
+                    "Threshold value changed for %s: %s -> %s",
+                    self.entity_id, old_value, value
+                )
+            else:
+                _LOGGER.debug(
+                    "Threshold value synced (unchanged) for %s: %s",
+                    self.entity_id, value
+                )
 
         except Exception:
             _LOGGER.exception("Failed to set threshold value from ESP32: %s", self.entity_id)
@@ -713,41 +676,42 @@ class ESPHomeThresholdNumber(NumberEntity):
         def handle_esp32_threshold_update(event):
             """Handle ESP32 threshold data update."""
             try:
-                event_node_id = str(event.data.get("node_id", "")).strip()
-                device_node_id = str(self._device_info.get("node_id", "")).strip()
+                # Normalize node_id to lowercase for comparison
+                event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
+                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
 
-                _LOGGER.debug(
-                    "比较node_id: event=%s, device=%s, event_data=%s",
-                    event_node_id,
-                    device_node_id,
-                    event.data,
-                )
-
-                if not event_node_id or not device_node_id:
-                    _LOGGER.debug("节点ID缺失，跳过更新")
-                    return
-
-                if event_node_id != device_node_id:
-                    _LOGGER.debug(
-                        "节点ID不匹配: %s != %s", event_node_id, device_node_id
-                    )
+                # Filter: only process events for this device
+                if not event_node_id or not device_node_id or event_node_id != device_node_id:
                     return
 
                 event_param = event.data.get("param_name", "")
                 expected_param = f"{self._sensor_type}_{self._threshold_type}_threshold"
 
-                if event_param == expected_param:
+                # Normalize ESP32's abbreviated param names to match entity's full sensor_type
+                # ESP32 uses: temp_*, humidity_*, but entities may use: ambient_temperature_*, ambient_humidity_*
+                normalized_event_param = event_param
+                if event_param.startswith("temp_"):
+                    # Check if this entity uses "ambient_temperature" or "temperature"
+                    if self._sensor_type in ["ambient_temperature", "temperature"]:
+                        normalized_event_param = event_param.replace("temp_", f"{self._sensor_type}_")
+                elif event_param.startswith("humidity_"):
+                    # Check if this entity uses "ambient_humidity"
+                    if self._sensor_type == "ambient_humidity":
+                        normalized_event_param = event_param.replace("humidity_", "ambient_humidity_")
+
+                if normalized_event_param == expected_param:
                     new_value = float(event.data.get("value", self._attr_native_value))
 
                     # Update value asynchronously
                     self.hass.async_create_task(self.async_set_esp32_value(new_value))
 
                     _LOGGER.debug(
-                        "Threshold entity received ESP32 update: %s = %s", expected_param, new_value
+                        "Threshold entity %s received ESP32 update: %s = %s",
+                        self._attr_unique_id, expected_param, new_value
                     )
 
             except Exception:
-                _LOGGER.exception("Failed to handle ESP32 threshold update event")
+                _LOGGER.exception("Failed to handle ESP32 threshold update event for %s", self._attr_unique_id)
 
         # Listen for ESP32 threshold data update events
         self.async_on_remove(
@@ -756,13 +720,56 @@ class ESPHomeThresholdNumber(NumberEntity):
             )
         )
 
+        # Listen for device availability changes
+        @callback
+        def handle_device_availability_change(event):
+            """Handle device availability change."""
+            try:
+                event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
+                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
+
+                if event_node_id == device_node_id:
+                    available = event.data.get("available", False)
+                    _LOGGER.debug(
+                        "Device %s availability changed to %s, updating threshold entity %s",
+                        device_node_id,
+                        "available" if available else "unavailable",
+                        self._attr_unique_id,
+                    )
+                    self.async_write_ha_state()
+            except Exception:
+                _LOGGER.exception("Failed to handle device availability change for %s", self._attr_unique_id)
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                f"{DOMAIN}_device_availability_changed", handle_device_availability_change
+            )
+        )
+
         _LOGGER.debug("Threshold number entity added to HA: %s", self._attr_unique_id)
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self._hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            node_id = str(self._device_info["node_id"]).lower()
+            return api.is_device_available(node_id)
+        return False
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes."""
+        attrs = {}
+        if self._last_esp32_sync:
+            # This ensures last_updated is refreshed after reconnection
+            attrs["last_update"] = self._last_esp32_sync.timestamp()
+        return attrs
 
     async def async_will_remove_from_hass(self) -> None:
         """Handle entity removal from Home Assistant."""
         await super().async_will_remove_from_hass()
         _LOGGER.debug("Threshold number entity removed from HA: %s", self._attr_unique_id)
-
 
 class ESPHomeBatteryConfigNumber(NumberEntity):
     """Battery configuration number entity (Battery Low Threshold and Battery Sampling Interval)."""
@@ -812,6 +819,14 @@ class ESPHomeBatteryConfigNumber(NumberEntity):
     def device_info(self) -> DeviceInfo:
         """Return the device info."""
         return self._attr_device_info
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self._hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
 
     async def async_set_native_value(self, value: float) -> None:
         """Set value and sync with ESP32."""
@@ -864,6 +879,33 @@ class ESPHomeBatteryConfigNumber(NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Entity added to Home Assistant."""
         await super().async_added_to_hass()
+
+        # Listen for device availability changes
+        @callback
+        def handle_device_availability_change(event):
+            """Handle device availability change."""
+            try:
+                event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
+                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
+
+                if event_node_id == device_node_id:
+                    available = event.data.get("available", False)
+                    _LOGGER.debug(
+                        "Device %s availability changed to %s, updating battery config entity %s",
+                        device_node_id,
+                        "available" if available else "unavailable",
+                        self._attr_unique_id,
+                    )
+                    self.async_write_ha_state()
+            except Exception:
+                _LOGGER.exception("Failed to handle device availability change for %s", self._attr_unique_id)
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                f"{DOMAIN}_device_availability_changed", handle_device_availability_change
+            )
+        )
+
         _LOGGER.debug("Battery config number entity added: %s", self._attr_unique_id)
 
     async def async_will_remove_from_hass(self) -> None:

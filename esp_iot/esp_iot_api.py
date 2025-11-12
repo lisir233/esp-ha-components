@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import socket
 import time
 from typing import Any
 
@@ -19,20 +20,22 @@ from zeroconf import ServiceBrowser
 from homeassistant.components import zeroconf
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 
 from .esp_local_ctrl_lib import esp_local_ctrl
 from .esp_iot_discovery import create_basic_device_config_from_properties
 from .esp_iot_local_ctrl import ESPLocalCtrlClient
-from .esp_iot_network import ESPDeviceListener
+from .esp_iot_network import DEVICE_SERVICE_TYPE, ESPDeviceListener, PROTO
 from .esp_iot_parser import ESPDeviceParser
 from .esp_iot_payload import ESPDeviceController
-from .esp_iot_spec import CONFIG_PROPERTY_NAMES, DEVICE_TYPES
+from .esp_iot_spec import CONFIG_PROPERTY_NAMES
 from .esp_iot_utils import fire_property_events
 
 _LOGGER = logging.getLogger(__name__)
 
 # Connection and timing constants
 RATE_LIMIT_INTERVAL = 10  # seconds between property calls per device
+MDNS_CHECK_TIMEOUT = 8.0  # seconds to wait for mDNS service detection (increased from 3.0 for reliability)
 
 
 class ESPHomeAPI:
@@ -54,8 +57,7 @@ class ESPHomeAPI:
         coordinator: Device coordinator for entity discovery
         devices: Dictionary of registered devices by node_id
         _local_ctrl_clients: Active ESP Local Control client connections
-        _connection_locks: Locks to prevent concurrent connection attempts
-        _property_fetch_locks: Locks to serialize property fetches per device
+        _property_fetch_locks: Unified locks to prevent concurrent operations (connections + property fetches)
     """
 
     def __init__(self, hass: HomeAssistant, domain: str, default_port: int = 8080) -> None:
@@ -80,8 +82,7 @@ class ESPHomeAPI:
         # ESP Local Control clients
         self._local_ctrl_clients: dict[str, ESPLocalCtrlClient] = {}
 
-        # Concurrency control
-        self._connection_locks: dict[str, asyncio.Lock] = {}
+        # Concurrency control - unified lock for both connections and property operations
         self._property_fetch_locks: dict[str, asyncio.Lock] = {}
 
         # Device parser
@@ -147,6 +148,218 @@ class ESPHomeAPI:
         self._rate_limit_tracker[last_call_key] = current_time
         return False
 
+    def is_device_available(self, node_id: str) -> bool:
+        """Check if device is available (registered and has active client).
+
+        Args:
+            node_id: Device node ID
+
+        Returns:
+            True if device is available, False otherwise
+        """
+        node_id_lower = node_id.lower()
+        
+        # Check if device is registered
+        if node_id_lower in self.devices:
+            device_info = self.devices[node_id_lower]
+            if not device_info.get("registered", False):
+                return False
+            
+            # Check if we have an active client
+            return node_id_lower in self._local_ctrl_clients
+        
+        return False
+
+    async def _check_tcp_port_ready(
+        self, host: str, port: int, timeout: float = 2.0
+    ) -> bool:
+        """Check if TCP port is accepting connections.
+        
+        This verifies the HTTP server is actually ready, not just mDNS broadcasting.
+        Prevents race condition where mDNS advertises availability before HTTP server starts.
+        
+        Args:
+            host: IP address or hostname
+            port: TCP port to check
+            timeout: Connection timeout in seconds
+            
+        Returns:
+            True if port accepts connections, False otherwise
+        """
+        try:
+            # Attempt TCP connection to verify port is ready
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout,
+            )
+            # Connection successful - close it immediately
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (TimeoutError, ConnectionRefusedError, OSError):
+            # Port not ready yet
+            return False
+        except Exception as err:
+            _LOGGER.debug(
+                "Unexpected error checking TCP port %s:%d: %s", host, port, err
+            )
+            return False
+
+    async def check_device_mdns_available(
+        self, node_id: str, expected_ip: str | None = None
+    ) -> bool:
+        """Check if device's mDNS service is broadcasting (device is online).
+
+        Creates a dedicated ServiceBrowser to detect this specific device via mDNS.
+        ESP32 devices broadcast mDNS on startup (2-3 times), then only respond to queries.
+        ServiceBrowser automatically sends queries, triggering ESP32 to respond.
+
+        Args:
+            node_id: Device node ID to check
+            expected_ip: Optional expected IP address to verify
+
+        Returns:
+            True if device mDNS detected and TCP ready, False otherwise
+        """
+        node_id = node_id.lower()
+        service_name = f"{node_id.upper()}._esp_local_ctrl._tcp.local."
+        
+        _LOGGER.debug(
+            "Creating dedicated mDNS listener for device %s (service: %s)",
+            node_id,
+            service_name,
+        )
+
+        detected = asyncio.Event()
+        detected_ip = None
+
+        class TempListener:
+            """Temporary listener for this specific device."""
+            
+            def add_service(self, zc, type_, name):
+                nonlocal detected_ip
+                if name.lower() == service_name.lower():
+                    _LOGGER.info("mDNS service added: %s", name)
+                    info = zc.get_service_info(type_, name)
+                    if info and info.addresses:
+                        detected_ip = socket.inet_ntoa(info.addresses[0])
+                        _LOGGER.info("Device %s detected via mDNS at %s", node_id, detected_ip)
+                        detected.set()
+
+            def update_service(self, zc, type_, name):
+                nonlocal detected_ip
+                if name.lower() == service_name.lower():
+                    _LOGGER.debug("mDNS service updated: %s", name)
+                    info = zc.get_service_info(type_, name)
+                    if info and info.addresses:
+                        detected_ip = socket.inet_ntoa(info.addresses[0])
+                        _LOGGER.info("Device %s detected via mDNS update at %s", node_id, detected_ip)
+                        detected.set()
+
+            def remove_service(self, zc, type_, name):
+                if name.lower() == service_name.lower():
+                    _LOGGER.debug("mDNS service removed: %s", name)
+
+        try:
+            from homeassistant.components import zeroconf as ha_zeroconf
+            
+            zc = await ha_zeroconf.async_get_instance(self.hass)
+            listener = TempListener()
+            
+            # Create ServiceBrowser - this will send mDNS query immediately
+            browser = ServiceBrowser(zc, "_esp_local_ctrl._tcp.local.", listener)
+            
+            try:
+                # Wait up to 3 seconds for mDNS detection
+                # ESP32 will respond within 1-2 seconds if it's online
+                # Short timeout for fast response, but keep browser alive for delayed responses
+                await asyncio.wait_for(detected.wait(), timeout=3.0)
+                
+                _LOGGER.info(
+                    "Device %s detected via mDNS at %s, verifying TCP connectivity",
+                    node_id,
+                    detected_ip,
+                )
+                
+                # Verify detected IP matches expected (if provided)
+                if expected_ip and detected_ip != expected_ip:
+                    _LOGGER.warning(
+                        "Device %s IP changed: expected %s, detected %s",
+                        node_id,
+                        expected_ip,
+                        detected_ip,
+                    )
+                    # Update device registry with new IP
+                    if node_id in self.devices:
+                        self.devices[node_id]["host"] = detected_ip
+                        self.devices[node_id]["ip"] = detected_ip
+                
+                # Use detected IP or fall back to registry
+                device_ip = detected_ip
+                if not device_ip:
+                    device_info = self.devices.get(node_id)
+                    if device_info:
+                        device_ip = device_info.get("host")
+                
+                if not device_ip:
+                    _LOGGER.warning("No IP address available for device %s", node_id)
+                    browser.cancel()
+                    return False
+                
+                # Verify TCP port is ready (mDNS may broadcast before HTTP server ready)
+                # ESP32 needs time after restart to fully boot and start HTTP server
+                # mDNS service starts quickly (~2s) but HTTP server needs ~30s
+                # Retry with 2s intervals to allow sufficient ESP32 boot time
+                max_retries = 15  # 15 retries × 2s = 30s max wait
+                for retry_count in range(max_retries):
+                    tcp_ready = await self._check_tcp_port_ready(device_ip, 8080, timeout=1.0)
+                    if tcp_ready:
+                        _LOGGER.info(
+                            "Device %s TCP port ready after %.1f seconds, device is online",
+                            node_id,
+                            retry_count * 2.0,
+                        )
+                        browser.cancel()  # Cancel immediately when device is confirmed online
+                        return True
+                    
+                    if retry_count < max_retries - 1:
+                        await asyncio.sleep(2.0)
+                
+                # Port still not ready after retries
+                _LOGGER.warning(
+                    "Device %s mDNS detected but TCP port not ready after %.1f seconds",
+                    node_id,
+                    max_retries * 2.0,
+                )
+                browser.cancel()
+                return False
+                
+            except TimeoutError:
+                # CRITICAL: Don't cancel browser immediately!
+                # ESP32 might be booting and will respond to our query in 10-30 seconds
+                # Keep the browser alive so it can receive the delayed response
+                _LOGGER.info(
+                    "Device %s not detected within 3 seconds, but keeping mDNS listener active for delayed response",
+                    node_id,
+                )
+                
+                # Schedule browser cleanup after 30 seconds in the background
+                # This allows ESP32 boot time while not blocking the caller
+                async def delayed_cleanup():
+                    await asyncio.sleep(30)
+                    browser.cancel()
+                    _LOGGER.debug("Cleaned up mDNS browser for device %s after 30s", node_id)
+                
+                self.hass.async_create_task(delayed_cleanup())
+                
+                # Return False immediately so caller can continue with fast retry cycle
+                # If ESP32 responds within 30s, global listener will trigger update_device()
+                return False
+                
+        except Exception as err:
+            _LOGGER.warning("Error checking mDNS availability for device %s: %s", node_id, err)
+            return False
+
     def _extract_current_values(self, properties: list) -> dict:
         """Extract current device values from properties.
 
@@ -176,20 +389,40 @@ class ESPHomeAPI:
                     continue
 
             if params_data:
-                # Extract all device types
-                for device_type in DEVICE_TYPES:
-                    if device_type in params_data:
-                        current_values[device_type] = params_data[device_type]
+                # ✅ OPTIMIZED: Extract ALL device types from params_data
+                # Don't limit to DEVICE_TYPES list - ESP32 may send new device types
+                for device_type, device_data in params_data.items():
+                    # Skip non-dict values (metadata fields)
+                    if not isinstance(device_data, dict):
+                        # Handle special case: "State" field for binary sensors
+                        if device_type == "State":
+                            current_values["Binary Sensor"] = {
+                                "Binary Sensor": device_data
+                            }
+                            _LOGGER.debug(
+                                "Extracted Binary Sensor state from property: %s",
+                                device_data,
+                            )
+                        continue
+                    
+                    # Store or merge device data
+                    if device_type not in current_values:
+                        current_values[device_type] = device_data
+                    else:
+                        # Merge if same device type appears in multiple properties
+                        current_values[device_type].update(device_data)
+                    
+                    _LOGGER.debug(
+                        "Extracted %s data from property: %s",
+                        device_type,
+                        device_data,
+                    )
 
-                # Handle special cases
-                if "State" in params_data:
-                    current_values["Binary Sensor"] = {
-                        "Binary Sensor": params_data["State"]
-                    }
-
-                if current_values:
-                    break
-
+        # Return all collected values from ALL properties
+        _LOGGER.debug(
+            "Total extracted device types: %s",
+            list(current_values.keys()),
+        )
         return current_values
 
     async def _trigger_platform_discovery(
@@ -498,7 +731,16 @@ class ESPHomeAPI:
             node_id: Device node ID
             params_data: Property data from ESP device
         """
+        _LOGGER.warning(
+            "🔥 [PROPERTY_UPDATE] Starting to process property update for device %s with data types: %s",
+            node_id,
+            list(params_data.keys()),
+        )
         fire_property_events(self.hass, self.domain, node_id, params_data)
+        _LOGGER.warning(
+            "🔥 [PROPERTY_UPDATE] Completed firing property events for device %s",
+            node_id,
+        )
 
     async def _check_and_reconnect_devices(self) -> None:
         """Check device connections and reconnect if disconnected.
@@ -511,7 +753,63 @@ class ESPHomeAPI:
         Called periodically by the monitoring loop every 60 seconds.
         """
         for node_id, device_info in list(self.devices.items()):
+            # ✅ FIXED: Don't skip unregistered devices - they might be offline and need reconnection
+            # Check if device is offline and needs reconnection attempt
             if not device_info.get("registered", False):
+                # Device is marked as unregistered (offline)
+                if device_info.get("offline_state", False):
+                    _LOGGER.debug(
+                        "Device %s is offline, attempting reconnection",
+                        node_id,
+                    )
+                    ip = device_info.get("ip")
+                    port = device_info.get("port", self.default_port)
+                    
+                    if not ip:
+                        _LOGGER.warning("Device %s has no IP address, skipping reconnection", node_id)
+                        continue
+                    
+                    mdns_available = await self.check_device_mdns_available(node_id, ip)
+                    
+                    if mdns_available:
+                        _LOGGER.info(
+                            "Device %s is back online, reconnecting",
+                            node_id,
+                        )
+                        
+                        # Ensure we have a lock for this device
+                        if node_id not in self._property_fetch_locks:
+                            self._property_fetch_locks[node_id] = asyncio.Lock()
+                        
+                        # Acquire lock before reconnection
+                        async with self._property_fetch_locks[node_id]:
+                            # Double-check: another operation might have already reconnected
+                            if node_id in self._local_ctrl_clients:
+                                check_client = self._local_ctrl_clients[node_id]
+                                if await check_client.is_connected():
+                                    _LOGGER.debug(
+                                        "Device %s already reconnected by another operation during offline recovery",
+                                        node_id,
+                                    )
+                                    device_info["registered"] = True
+                                    device_info["offline_state"] = False
+                                    continue
+                            
+                            device_info["registered"] = True
+                            device_info["offline_state"] = False
+                            
+                            success, _ = await self._establish_and_sync_device(
+                                node_id, ip, port, fire_online_event=True
+                            )
+                            if success:
+                                _LOGGER.info("Successfully reconnected offline device %s", node_id)
+                            else:
+                                _LOGGER.warning("Failed to reconnect device %s, will retry", node_id)
+                    else:
+                        _LOGGER.debug("Device %s still offline (mDNS + TCP not available)", node_id)
+                else:
+                    # Device is unregistered but not marked offline (initial state)
+                    _LOGGER.debug("Device %s is unregistered but not offline, skipping", node_id)
                 continue
 
             # Check if we have a client for this device
@@ -521,16 +819,29 @@ class ESPHomeAPI:
                     "attempting to establish connection",
                     node_id,
                 )
-                # Try to establish connection to recover from inconsistent state
-                ip = device_info.get("ip")
-                port = device_info.get("port", self.default_port)
-                if ip and await self.establish_local_ctrl_session(node_id, ip, port):
-                    _LOGGER.info("Successfully connected to device %s", node_id)
-                    # Fetch properties to resync state
-                    try:
-                        await self.get_local_ctrl_properties(node_id, skip_discovery=True)
-                    except Exception as err:
-                        _LOGGER.debug("Error fetching properties after reconnect: %s", err)
+                
+                # Ensure we have a lock for this device
+                if node_id not in self._property_fetch_locks:
+                    self._property_fetch_locks[node_id] = asyncio.Lock()
+                
+                # Acquire lock before establishing connection
+                async with self._property_fetch_locks[node_id]:
+                    # Double-check: another operation might have already created client
+                    if node_id in self._local_ctrl_clients:
+                        check_client = self._local_ctrl_clients[node_id]
+                        if await check_client.is_connected():
+                            _LOGGER.debug(
+                                "Device %s client created by another operation, skipping",
+                                node_id,
+                            )
+                            continue
+                    
+                    # Try to establish connection to recover from inconsistent state
+                    ip = device_info.get("ip")
+                    port = device_info.get("port", self.default_port)
+                    success, _ = await self._establish_and_sync_device(node_id, ip, port)
+                    if ip and success:
+                        _LOGGER.info("Successfully connected and synced device %s", node_id)
                 continue
 
             # Check if existing client is still connected
@@ -539,41 +850,189 @@ class ESPHomeAPI:
                 continue
 
             try:
+                # Check connection status outside any lock (quick check)
                 if not await client.is_connected():
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "Device %s disconnected (socket closed), attempting reconnect",
                         node_id,
                     )
-                    # Clean up old client
-                    await client.disconnect()
-                    del self._local_ctrl_clients[node_id]
-                    device_info["registered"] = False
-
-                    # Attempt to reconnect
-                    ip = device_info.get("ip")
-                    port = device_info.get("port", self.default_port)
-                    if ip and await self.establish_local_ctrl_session(node_id, ip, port):
-                        device_info["registered"] = True
-                        _LOGGER.info(
-                            "Successfully reconnected to device %s after disconnect",
-                            node_id,
+                    
+                    # Try to acquire property lock with timeout
+                    # If manual operation is in progress, skip this cycle
+                    if node_id not in self._property_fetch_locks:
+                        self._property_fetch_locks[node_id] = asyncio.Lock()
+                    
+                    lock = self._property_fetch_locks[node_id]
+                    
+                    try:
+                        # Try to acquire lock with 0.1s timeout
+                        # Manual operations have priority - if they're running, skip
+                        await asyncio.wait_for(
+                            lock.acquire(),
+                            timeout=0.1
                         )
-                        # Fetch properties to resync state
-                        try:
-                            await self.get_local_ctrl_properties(node_id, skip_discovery=True)
-                            _LOGGER.debug(
-                                "Property resync completed for device %s after reconnect",
-                                node_id,
-                            )
-                        except Exception as err:
-                            _LOGGER.debug(
-                                "Error fetching properties after reconnect: %s", err
-                            )
-                    else:
+                    except TimeoutError:
                         _LOGGER.warning(
-                            "Failed to reconnect to device %s, will retry later",
+                            "Device %s reconnection skipped - operation already in progress",
                             node_id,
                         )
+                        continue
+                    
+                    try:
+                        # Initialize variables for entity discovery after lock release
+                        properties_for_discovery = None
+                        needs_discovery = False
+                        
+                        # Double-check: another operation might have already reconnected
+                        if node_id in self._local_ctrl_clients:
+                            check_client = self._local_ctrl_clients[node_id]
+                            if await check_client.is_connected():
+                                _LOGGER.debug(
+                                    "Device %s already reconnected by another operation",
+                                    node_id,
+                                )
+                                device_info["registered"] = True
+                                continue
+                        
+                        # Clean up old client
+                        await client.disconnect()
+                        # Wait for TCP FIN/RST to complete to avoid connection leaks
+                        await asyncio.sleep(0.2)
+                        if node_id in self._local_ctrl_clients:
+                            del self._local_ctrl_clients[node_id]
+                        
+                        # ⚠️ DON'T set registered=False immediately!
+                        # Keep it True during fast reconnection to prevent entities from becoming unavailable
+                        # Only set to False if device is truly offline (mDNS + TCP not available)
+
+                        # Clear discovery flag on reconnection to allow re-discovery
+                        node_id_lower = node_id.lower()
+                        self._discovery_completed.discard(node_id)
+                        self._discovery_completed.discard(node_id_lower)
+
+                        # Get device connection info
+                        ip = device_info.get("ip")
+                        port = device_info.get("port", self.default_port)
+                        
+                        # ✅ CORRECT LOGIC: Check mDNS + TCP availability first
+                        # ESP32 socket disconnected scenarios:
+                        # 1. ESP32 restarting (fast) → mDNS + TCP available → immediate reconnect
+                        # 2. ESP32 powered off → mDNS + TCP not available → fire offline event
+                        # 3. Network issue → mDNS + TCP might still be there → try reconnect
+                        
+                        _LOGGER.info(
+                            "Device %s socket disconnected, checking mDNS + TCP availability",
+                            node_id,
+                        )
+                        
+                        # Check if device mDNS + TCP are still available
+                        mdns_available = await self.check_device_mdns_available(node_id, ip)
+                        
+                        was_offline = device_info.get("offline_state", False)
+                        
+                        _LOGGER.debug(
+                            "Device %s reconnection: mdns_available=%s, was_offline=%s",
+                            node_id,
+                            mdns_available,
+                            was_offline,
+                        )
+                        
+                        if mdns_available:
+                            if was_offline:
+                                _LOGGER.info(
+                                    "Device %s was offline, now available, firing online event",
+                                    node_id,
+                                )
+                                fire_online = True
+                            else:
+                                _LOGGER.debug(
+                                    "Device %s fast reconnect, no online event",
+                                    node_id,
+                                )
+                                fire_online = False
+                            
+                            if was_offline:
+                                device_info["registered"] = True
+                                device_info["offline_state"] = False
+                            
+                            success, properties_for_discovery = await self._establish_and_sync_device(
+                                node_id, ip, port, fire_online_event=fire_online
+                            )
+                            
+                            if ip and success:
+                                if was_offline:
+                                    _LOGGER.info(
+                                        "Successfully reconnected device %s from offline state",
+                                        node_id,
+                                    )
+                                else:
+                                    _LOGGER.debug(
+                                        "Successfully reconnected device %s",
+                                        node_id,
+                                    )
+                                
+                                # Check if discovery is needed
+                                needs_discovery = (
+                                    not self.is_discovery_completed(node_id)
+                                    and properties_for_discovery is not None
+                                )
+                            else:
+                                _LOGGER.warning(
+                                    "Device %s reconnection failed despite mDNS + TCP available, will retry in 60s",
+                                    node_id,
+                                )
+                                properties_for_discovery = None
+                                needs_discovery = False
+                        else:
+                            if not was_offline:
+                                _LOGGER.warning(
+                                    "Device %s is offline",
+                                    node_id,
+                                )
+                                
+                                # Set registered=False ONLY when truly offline
+                                device_info["registered"] = False
+                                
+                                # Fire device availability changed event to update all entities to unavailable
+                                self.hass.bus.async_fire(
+                                    f"{self.domain}_device_availability_changed",
+                                    {
+                                        "node_id": node_id,
+                                        "available": False,
+                                        "timestamp": asyncio.get_event_loop().time(),
+                                    },
+                                )
+                                _LOGGER.info("Fired device_availability_changed event for %s (available=False, entities marked unavailable)", node_id)
+                                
+                                # Mark device as offline
+                                device_info["offline_state"] = True
+                            else:
+                                _LOGGER.debug(
+                                    "Device %s still offline (already in offline state, no duplicate event)",
+                                    node_id,
+                                )
+                            
+                            # Will retry in next 60s loop check cycle
+                            # If mDNS + TCP come back, will reconnect and fire online event
+                            properties_for_discovery = None
+                            needs_discovery = False
+                    finally:
+                        # Always release the lock
+                        lock.release()
+                    
+                    # Do entity discovery OUTSIDE the lock to avoid blocking
+                    if needs_discovery and properties_for_discovery:
+                        _LOGGER.debug("Starting entity discovery for %s", node_id)
+                        try:
+                            await self.parse_and_discover_entities(
+                                node_id, properties_for_discovery
+                            )
+                            self.mark_discovery_completed(node_id)
+                            _LOGGER.debug("Entity discovery completed for %s", node_id)
+                        except Exception as err:
+                            _LOGGER.warning(
+                                "Error during entity discovery for %s: %s", node_id, err
+                            )
 
             except Exception as err:
                 _LOGGER.warning(
@@ -603,14 +1062,154 @@ class ESPHomeAPI:
 
         # Note: cleanup() is now a method of this class, no separate coordinator
 
+    async def _establish_and_sync_device(
+        self,
+        node_id: str,
+        ip: str,
+        port: int,
+        *,
+        process_properties: bool = True,
+        wait_after_sync: float = 0.0,
+        fire_online_event: bool = False,
+    ) -> tuple[bool, list | None]:
+        """Establish connection and sync all device properties.
+        
+        This unified method handles device connection with property synchronization.
+        Used across all connection scenarios to ensure consistent behavior.
+        
+        Args:
+            node_id: Device node ID
+            ip: Device IP address
+            port: Device port
+            process_properties: If True, process fetched properties (default: True)
+                               Set to False if caller wants raw properties without processing
+            wait_after_sync: Seconds to wait after sync (default: 0.0)
+            fire_online_event: If True, fire device_availability_changed event (available=True) before sync (default: False)
+                              Only set to True when recovering from offline state
+        
+        Returns:
+            Tuple of (success: bool, properties: list | None)
+            - success: True if connection and sync succeeded
+            - properties: Fetched properties (None if fetch failed)
+        """
+        # Step 0: Check if already connected (prevent concurrent reconnections)
+        if node_id in self._local_ctrl_clients:
+            existing_client = self._local_ctrl_clients[node_id]
+            if await existing_client.is_connected():
+                _LOGGER.debug(
+                    "Device %s already connected (concurrent reconnection avoided), skipping reconnection",
+                    node_id
+                )
+        
+        # Step 1: Establish connection
+        if not await self.establish_local_ctrl_session(node_id, ip, port):
+            return (False, None)
+        
+        # Step 2: Property synchronization
+        # ✅ CRITICAL ORDER:
+        # 1. Fire online event FIRST (if requested) → entities become available
+        # 2. Then sync properties → entities update state while available
+        # This ensures entities don't update state while still unavailable
+        
+        fetched_properties = None
+        _LOGGER.debug(
+            "Starting property sync for %s (fire_online_event=%s)",
+            node_id,
+            fire_online_event,
+        )
+        
+        if fire_online_event:
+            self.hass.bus.async_fire(
+                f"{self.domain}_device_availability_changed",
+                {
+                    "node_id": node_id,
+                    "available": True,
+                    "timestamp": asyncio.get_event_loop().time(),
+                },
+            )
+            _LOGGER.debug(
+                "Fired device_availability_changed event for %s",
+                node_id,
+            )
+        
+        try:
+            client = self._local_ctrl_clients.get(node_id)
+            if client and isinstance(client, ESPLocalCtrlClient):
+                properties = await client.get_property_values()
+                if properties:
+                    fetched_properties = properties
+                    _LOGGER.debug(
+                        "Fetched %d properties from device %s after connection",
+                        len(properties),
+                        node_id,
+                    )
+                    
+                    # Only process if requested
+                    if process_properties:
+                        _LOGGER.debug(
+                            "Processing properties for %s",
+                            node_id,
+                        )
+                        # Extract and process property updates
+                        current_values = self._extract_current_values(properties)
+                        if current_values:
+                            _LOGGER.warning(
+                                "🔵 [SYNC] Extracted current values for %s: %s",
+                                node_id,
+                                list(current_values.keys()),
+                            )
+                            _LOGGER.warning(
+                                "🔵 [SYNC] About to call process_property_update for %s...",
+                                node_id,
+                            )
+                            self.process_property_update(node_id, current_values)
+                            _LOGGER.warning(
+                                "🔵 [SYNC] Completed process_property_update for %s - all entity states synced",
+                                node_id,
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "⚠️ [SYNC] Failed to extract property values for %s, but device is still online",
+                                node_id,
+                            )
+                    else:
+                        _LOGGER.warning(
+                            "🔵 [SYNC] Skipping property processing for %s (process_properties=False)",
+                            node_id,
+                        )
+                else:
+                    _LOGGER.debug(
+                        "No properties returned from device %s",
+                        node_id,
+                    )
+            else:
+                _LOGGER.debug(
+                    "Client not found or invalid for device %s",
+                    node_id,
+                )
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to sync properties after connection for %s: %s",
+                node_id,
+                err,
+            )
+        
+        # Step 3: Optional wait for ESP32 to be ready
+        if wait_after_sync > 0:
+            await asyncio.sleep(wait_after_sync)
+        
+        return (True, fetched_properties)
+
     async def establish_local_ctrl_session(
         self, node_id: str, ip: str, port: int | None = None
     ) -> bool:
         """Establish ESP Local Control session with the device.
 
         Creates or reuses an ESP Local Control client connection to the device.
-        Uses locks to prevent concurrent connection attempts to the same device.
-        Retrieves and applies configured PoP (Proof of Possession) if available.
+        
+        ⚠️ IMPORTANT: This method does NOT acquire locks internally.
+        Callers must hold _property_fetch_locks[node_id] before calling this method
+        to prevent concurrent operations.
 
         Args:
             node_id: Unique device identifier
@@ -623,59 +1222,55 @@ class ESPHomeAPI:
         if port is None:
             port = self.default_port
 
-        # Ensure we have a lock for this device
-        if node_id not in self._connection_locks:
-            self._connection_locks[node_id] = asyncio.Lock()
+        # Check if already connected (caller should have already checked, but double-check)
+        if node_id in self._local_ctrl_clients:
+            existing_client = self._local_ctrl_clients[node_id]
+            if await existing_client.is_connected():
+                return True
+            await existing_client.disconnect()
+            del self._local_ctrl_clients[node_id]
 
-        async with self._connection_locks[node_id]:
-            if node_id in self._local_ctrl_clients:
-                existing_client = self._local_ctrl_clients[node_id]
-                if await existing_client.is_connected():
-                    return True
-                await existing_client.disconnect()
-                del self._local_ctrl_clients[node_id]
+        try:
+            pop_value = self._get_configured_pop(node_id)
+            security_version = self._get_configured_security_version(node_id)
 
-            try:
-                pop_value = self._get_configured_pop(node_id)
-                security_version = self._get_configured_security_version(node_id)
+            client = ESPLocalCtrlClient(
+                node_id,
+                ip,
+                port=port,
+                pop=pop_value,
+                security_mode=security_version,
+            )
 
-                client = ESPLocalCtrlClient(
-                    node_id,
-                    ip,
-                    port=port,
-                    pop=pop_value,
-                    security_mode=security_version,
-                )
+            client.add_message_callback(self._create_message_handler(node_id))
 
-                client.add_message_callback(self._create_message_handler(node_id))
+            if await client.connect():
+                self._local_ctrl_clients[node_id] = client
+                return True
 
-                if await client.connect():
-                    self._local_ctrl_clients[node_id] = client
-                    return True
+            _LOGGER.warning(
+                "Failed to connect to device %s at %s:%s", node_id, ip, port
+            )
+            await client.disconnect()
+            return False
 
-                _LOGGER.warning(
-                    "Failed to connect to device %s at %s:%s", node_id, ip, port
-                )
-                await client.disconnect()
-                return False
-
-            except ConnectionError as err:
-                _LOGGER.error(
-                    "Connection error for device %s at %s:%s: %s",
-                    node_id,
-                    ip,
-                    port,
-                    err,
-                )
-                return False
-            except Exception:
-                _LOGGER.exception(
-                    "Unexpected error connecting to device %s at %s:%s",
-                    node_id,
-                    ip,
-                    port,
-                )
-                return False
+        except ConnectionError as err:
+            _LOGGER.error(
+                "Connection error for device %s at %s:%s: %s",
+                node_id,
+                ip,
+                port,
+                err,
+            )
+            return False
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected error connecting to device %s at %s:%s",
+                node_id,
+                ip,
+                port,
+            )
+            return False
 
     def _get_configured_pop(self, node_id: str) -> str:
         """Get the configured PoP value for a device."""
@@ -707,70 +1302,108 @@ class ESPHomeAPI:
     async def get_local_ctrl_properties(
         self, node_id: str, skip_discovery: bool = False
     ) -> list:
-        """Get all properties from ESP32 device using ESP Local Control client."""
+        """Get all properties from ESP32 device using ESP Local Control client.
+        
+        This method ONLY fetches properties and prepares them for discovery.
+        It does NOT fire events or process property updates.
+        Caller is responsible for processing the returned properties.
+        
+        Args:
+            node_id: Device node ID
+            skip_discovery: If True, skip entity discovery even if not completed
+        """
         if node_id not in self._property_fetch_locks:
             self._property_fetch_locks[node_id] = asyncio.Lock()
-
+        
+        # Store properties for discovery outside the lock
+        properties_for_discovery = None
+        needs_discovery = False
+        
         async with self._property_fetch_locks[node_id]:
+            properties = None
+            
+            # If client doesn't exist, establish connection and fetch properties
             if node_id not in self._local_ctrl_clients:
-                if node_id in self.devices:
-                    device_port = self.devices[node_id].get("port", self.default_port)
-                    if not await self.establish_local_ctrl_session(
-                        node_id, self.devices[node_id]["ip"], device_port
-                    ):
-                        return []
-                else:
+                if node_id not in self.devices:
                     return []
+                    
+                device_port = self.devices[node_id].get("port", self.default_port)
+                ip = self.devices[node_id]["ip"]
+                
+                # ✅ OPTIMIZED: Let _establish_and_sync_device fetch properties
+                # But skip processing - we only want the raw properties
+                success, properties = await self._establish_and_sync_device(
+                    node_id, ip, device_port,
+                    process_properties=False,  # Fetch but don't process them
+                    fire_online_event=False
+                )
+                if not success or not properties:
+                    return []
+            else:
+                # Client exists, just fetch properties
+                try:
+                    client_info = self._local_ctrl_clients[node_id]
 
-            try:
-                client_info = self._local_ctrl_clients[node_id]
-
-                if isinstance(client_info, ESPLocalCtrlClient):
+                    if not isinstance(client_info, ESPLocalCtrlClient):
+                        return []
+                        
                     properties = await client_info.get_property_values()
-                    if properties:
-                        if (
-                            not skip_discovery
-                            and not self.is_discovery_completed(node_id)
-                        ):
-                            await self.parse_and_discover_entities(
-                                node_id, properties
-                            )
-                            self.mark_discovery_completed(node_id)
+                    if not properties:
+                        return []
 
-                        return [
-                            {
-                                "device": "Light",
-                                "name": prop["name"],
-                                "value": prop["value"],
-                                "type": "bool"
-                                if prop["type"] == 1  # PROP_TYPE_BOOLEAN
-                                else "int",
-                            }
-                            for prop in properties
-                        ]
+                except Exception:
+                    _LOGGER.exception("Error getting local ctrl properties for %s", node_id)
+                    return []
+            
+            # Check if discovery is needed
+            if (
+                not skip_discovery
+                and not self.is_discovery_completed(node_id)
+            ):
+                properties_for_discovery = properties
+                needs_discovery = True
 
-                return []
-
+            # ✅ CLEAN: get_local_ctrl_properties ONLY fetches properties
+            # It does NOT fire events or process updates
+            # Caller (_update_device_states, etc.) is responsible for processing
+        
+        # Do entity discovery OUTSIDE the lock to avoid blocking other operations
+        # Entity discovery can take 10-20 seconds as it creates many entities
+        if needs_discovery and properties_for_discovery:
+            _LOGGER.debug("Starting entity discovery for device %s", node_id)
+            try:
+                await self.parse_and_discover_entities(
+                    node_id, properties_for_discovery
+                )
+                self.mark_discovery_completed(node_id)
+                _LOGGER.debug("Entity discovery completed for device %s", node_id)
             except Exception:
-                _LOGGER.exception("Error getting local ctrl properties for %s", node_id)
-                return []
+                _LOGGER.exception("Error during entity discovery for %s", node_id)
+        
+        return properties if properties else []
 
     async def set_local_ctrl_property(
         self, node_id: str, prop_name: str, value
     ) -> bool:
         """Set ESP32 device property value using ESP Device Controller."""
+        
         # Ensure we have a property-setting lock for this device to prevent concurrent modifications
         if node_id not in self._property_fetch_locks:
             self._property_fetch_locks[node_id] = asyncio.Lock()
+        
+        # Track if we need to handle reconnection after releasing lock
+        need_reconnect = False
 
         # Use the same lock as property fetch to serialize all operations
         async with self._property_fetch_locks[node_id]:
             if node_id not in self._local_ctrl_clients:
                 if node_id in self.devices:
                     device_port = self.devices[node_id].get("port", self.default_port)
-                    if not await self.establish_local_ctrl_session(
-                        node_id, self.devices[node_id]["ip"], device_port
-                    ):
+                    ip = self.devices[node_id]["ip"]
+                    # ✅ FIX: Use unified method to establish connection AND sync all properties
+                    # This ensures all entities are updated, not just the one being set
+                    success, _ = await self._establish_and_sync_device(node_id, ip, device_port)
+                    if not success:
                         return False
                 else:
                     return False
@@ -779,14 +1412,6 @@ class ESPHomeAPI:
                 client_info = self._local_ctrl_clients[node_id]
 
                 if isinstance(client_info, ESPLocalCtrlClient):
-                    if not await client_info.is_connected():
-                        _LOGGER.debug(
-                            "Device %s not connected, attempting to connect",
-                            node_id
-                        )
-                        if not await client_info.connect():
-                            return False
-
                     device_controller = ESPDeviceController(client_info)
 
                     # Try to set property with timeout to detect connection failures faster
@@ -802,52 +1427,204 @@ class ESPHomeAPI:
                                 self.devices[node_id]["properties"] = {}
                             self.devices[node_id]["properties"][prop_name] = value
                             return True
-                    except TimeoutError:
-                        _LOGGER.warning(
-                            "Property set timeout for device %s",
-                            node_id,
-                        )
-
-                    # Failed or timeout: check if connection is still alive
-                    connection_alive = await client_info.is_connected()
-                    # Connection is DEAD - need to reconnect
-                    if not connection_alive:
-                        _LOGGER.info(
-                            "Connection lost for device %s, attempting reconnect",
-                            node_id,
-                        )
-                        # Clean up broken connection (will clear session)
-                        await client_info.disconnect()
-
-                        # Reconnect and re-establish session
-                        if await client_info.connect():
-                            # Create new device controller with fresh session
-                            device_controller = ESPDeviceController(client_info)
-
-                            # Retry once after reconnection
-                            if await device_controller.set_device_property(prop_name, value):
-                                _LOGGER.info(
-                                    "Property set succeeded after reconnect for device %s",
-                                    node_id
-                                )
-                                if "properties" not in self.devices[node_id]:
-                                    self.devices[node_id]["properties"] = {}
-                                self.devices[node_id]["properties"][prop_name] = value
-                                return True
-                            _LOGGER.warning(
-                                "Property set failed after reconnect for device %s",
-                                node_id,
-                            )
                         else:
-                            _LOGGER.error(
-                                "Failed to reconnect to device %s",
+                            # Property set failed - check connection and reconnect
+                            _LOGGER.warning(
+                                "Property set failed for device %s, will attempt reconnect",
                                 node_id,
                             )
-
-                    return False
+                            need_reconnect = True
+                    except TimeoutError:
+                        # Timeout indicates connection problem - trigger immediate reconnect
+                        _LOGGER.warning(
+                            "Property set timeout for device %s, will attempt reconnect",
+                            node_id,
+                        )
+                        need_reconnect = True
 
             except Exception:
+                _LOGGER.exception("Exception in set_local_ctrl_property for node_id=%s", node_id)
+        
+        # Handle reconnection OUTSIDE the lock context to avoid deadlock
+        # This allows _fast_reconnect_for_manual_operation to acquire the lock
+        if need_reconnect:
+            _LOGGER.debug("Calling fast reconnect for node_id=%s", node_id)
+            return await self._fast_reconnect_for_manual_operation(
+                node_id, prop_name, value
+            )
+
+        return False
+
+    async def _fast_reconnect_for_manual_operation(
+        self, node_id: str, prop_name: str, value: Any
+    ) -> bool:
+        """Fast reconnection path for manual operations (user-initiated).
+
+        When timeout/failure occurs, this function:
+        1. Checks if another operation already reconnected (passive check)
+        2. If not, performs full reconnection: cleanup → mDNS check → reconnect
+        3. Retries property set after successful reconnection
+
+        Args:
+            node_id: Device node ID
+            prop_name: Property name to set after reconnection
+            value: Property value to set
+
+        Returns:
+            True if reconnection and property set succeeded, False otherwise
+        """
+        if node_id not in self._property_fetch_locks:
+            self._property_fetch_locks[node_id] = asyncio.Lock()
+
+        # Try to acquire lock with timeout to avoid blocking user operations indefinitely
+        # Manual operations should have higher priority than background checks
+        _LOGGER.debug(
+            "Manual operation acquiring lock for device %s reconnection",
+            node_id,
+        )
+        
+        lock = self._property_fetch_locks[node_id]
+        
+        try:
+            # Try to acquire lock with 5s timeout
+            # If background loop is reconnecting, we can wait a bit but not forever
+            await asyncio.wait_for(lock.acquire(), timeout=5.0)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Manual operation timed out waiting for lock on device %s - another operation in progress",
+                node_id,
+            )
+            return False
+        
+        try:
+            _LOGGER.debug("Manual operation acquired lock for device %s", node_id)
+            
+            # Check if device already reconnected by another operation (e.g., loop check)
+            # This is just an optimization to avoid unnecessary reconnection
+            if node_id in self._local_ctrl_clients:
+                check_client = self._local_ctrl_clients[node_id]
+                if await check_client.is_connected():
+                    _LOGGER.info(
+                        "Device %s already reconnected by another operation, will retry property set",
+                        node_id,
+                    )
+                    # Another operation already reconnected - just retry once
+                    device_controller = ESPDeviceController(check_client)
+                    
+                    try:
+                        if await asyncio.wait_for(
+                            device_controller.set_device_property(prop_name, value),
+                            timeout=2.0
+                        ):
+                            _LOGGER.info(
+                                "Property set succeeded after another operation reconnected device %s",
+                                node_id
+                            )
+                            if "properties" not in self.devices[node_id]:
+                                self.devices[node_id]["properties"] = {}
+                            self.devices[node_id]["properties"][prop_name] = value
+                            return True
+                    except (TimeoutError, OSError, ConnectionError) as ex:
+                        _LOGGER.warning(
+                            "Retry failed even after reconnection by another operation for device %s: %s",
+                            node_id, type(ex).__name__
+                        )
+                        # Fall through to perform our own reconnection
+            
+            # Perform full reconnection ourselves
+            _LOGGER.info("Manual operation performing full reconnection for device %s", node_id)
+
+            # Get old client for cleanup
+            old_client = self._local_ctrl_clients.get(node_id)
+            
+            # Complete cleanup: disconnect and remove old client
+            if old_client:
+                await old_client.disconnect()
+                # Wait for TCP FIN/RST to complete to avoid connection leaks
+                # This prevents old socket from retransmitting while new connection establishes
+                await asyncio.sleep(0.2)
+            if node_id in self._local_ctrl_clients:
+                del self._local_ctrl_clients[node_id]
+
+            # Clear discovery flag on reconnection to allow re-discovery
+            node_id_lower = node_id.lower()
+            self._discovery_completed.discard(node_id)
+            self._discovery_completed.discard(node_id_lower)
+
+            # Check mDNS before fast reconnect (manual operation)
+            ip = self.devices[node_id].get("ip")
+            port = self.devices[node_id].get("port", self.default_port)
+
+            _LOGGER.debug("Checking device %s mDNS availability before manual reconnect", node_id)
+            if not await self.check_device_mdns_available(node_id, ip):
+                _LOGGER.warning(
+                    "Device %s mDNS service not detected during manual operation, device may be offline",
+                    node_id,
+                )
+                
+                # Fire device availability changed event to update all entities to unavailable
+                self.hass.bus.async_fire(
+                    f"{self.domain}_device_availability_changed",
+                    {
+                        "node_id": node_id,
+                        "available": False,
+                        "timestamp": asyncio.get_event_loop().time(),
+                    },
+                )
+                _LOGGER.debug("Fired device_availability_changed event for %s (available=False, manual path)", node_id)
+                
+                # Device offline - return False immediately
                 return False
+
+            # mDNS detected, proceed with fast reconnect
+            # Use unified method with wait_after_sync=1.0 to prepare ESP32 for retry
+            # Set fire_online_event=True because we're recovering from offline state
+            success, _ = await self._establish_and_sync_device(
+                node_id, ip, port, wait_after_sync=1.0, fire_online_event=True
+            )
+            if ip and success:
+                _LOGGER.info(
+                    "Successfully reconnected and synced device %s during manual operation",
+                    node_id
+                )
+                
+                # Get the newly created client for property retry
+                new_client = self._local_ctrl_clients[node_id]
+                device_controller = ESPDeviceController(new_client)
+                
+                # Single retry after new connection (ESP32 already waited 1s)
+                try:
+                    if await asyncio.wait_for(
+                        device_controller.set_device_property(prop_name, value),
+                        timeout=2.0
+                    ):
+                        _LOGGER.info(
+                            "Property set succeeded after manual reconnect for device %s",
+                            node_id
+                        )
+                        if "properties" not in self.devices[node_id]:
+                            self.devices[node_id]["properties"] = {}
+                        self.devices[node_id]["properties"][prop_name] = value
+                        return True
+                except (TimeoutError, OSError, ConnectionError) as ex:
+                    _LOGGER.warning(
+                        "Property set failed after manual reconnect for device %s: %s",
+                        node_id, type(ex).__name__
+                    )
+                
+                return False
+
+            _LOGGER.error(
+                "Failed to reconnect to device %s",
+                node_id,
+            )
+            return False
+        finally:
+            # Always release the lock
+            lock.release()
+
+        # This should not be reached, but return False as fallback
+        return False
 
     async def register_device(self, node_id: str, ip: str, port: int | None = None) -> bool:
         """Register device."""
@@ -866,10 +1643,46 @@ class ESPHomeAPI:
 
         device_info = self.devices[node_id]
 
-        if await self.establish_local_ctrl_session(node_id, ip, port):
-            device_info["registered"] = True
-            device_info["last_success"] = asyncio.get_event_loop().time()
-            return True
+        # Ensure we have a lock for this device
+        if node_id not in self._property_fetch_locks:
+            self._property_fetch_locks[node_id] = asyncio.Lock()
+
+        # Acquire lock before establishing connection
+        async with self._property_fetch_locks[node_id]:
+            # Check if already connected (another operation might have connected)
+            if node_id in self._local_ctrl_clients:
+                existing_client = self._local_ctrl_clients[node_id]
+                if await existing_client.is_connected():
+                    _LOGGER.debug(
+                        "Device %s already connected during registration",
+                        node_id
+                    )
+                    device_info["registered"] = True
+                    device_info["last_success"] = asyncio.get_event_loop().time()
+                    return True
+
+            # Check if device is recovering from offline state
+            was_offline = device_info.get("offline_state", False)
+            fire_online = was_offline  # Fire event if recovering from offline
+            
+            if was_offline:
+                _LOGGER.info(
+                    "Device %s is recovering from offline state via mDNS discovery, will fire online event",
+                    node_id
+                )
+                # ✅ CRITICAL: Set registered=True BEFORE calling _establish_and_sync_device
+                # This ensures is_device_available() returns True when device_availability_changed event fires
+                device_info["registered"] = True
+                device_info["offline_state"] = False
+
+            # Use unified method to establish connection and sync properties
+            success, _ = await self._establish_and_sync_device(
+                node_id, ip, port, fire_online_event=fire_online
+            )
+            if success:
+                device_info["registered"] = True
+                device_info["last_success"] = asyncio.get_event_loop().time()
+                return True
 
         return False
 
@@ -881,6 +1694,9 @@ class ESPHomeAPI:
         2. Cleans up all tracking data
         3. Disconnects local control client
         4. Clears discovery cache (for both original and lowercase variants)
+        5. Clears discovery completed flags
+        6. Clears config entry mappings
+        7. Clears rate limit tracking data
 
         Args:
             node_id: Device node ID to unregister (as stored in config entry)
@@ -891,10 +1707,9 @@ class ESPHomeAPI:
         self.devices.pop(node_id, None)
         self.devices.pop(node_id_lower, None)
 
-        # Clean up device tracking data
+        # Clean up device tracking data (unified lock)
+        self._property_fetch_locks.pop(node_id, None)
         self._property_fetch_locks.pop(node_id_lower, None)
-        self._connection_locks.pop(node_id, None)
-        self._connection_locks.pop(node_id_lower, None)
 
         # Clean up cached discovery data from hass.data
         cache_keys = [
@@ -910,6 +1725,18 @@ class ESPHomeAPI:
         for cache_key in cache_keys:
             self.hass.data.get(self.domain, {}).pop(cache_key, None)
 
+        # FIX 1: Clear discovery completed flags (for both variants)
+        self._discovery_completed.discard(node_id)
+        self._discovery_completed.discard(node_id_lower)
+
+        # FIX 2: Clear config entry mappings (for both variants)
+        self._device_config_entries.pop(node_id, None)
+        self._device_config_entries.pop(node_id_lower, None)
+
+        # FIX 3: Clear rate limit tracking data (for both variants)
+        self._rate_limit_tracker.pop(f"last_property_call_{node_id}", None)
+        self._rate_limit_tracker.pop(f"last_property_call_{node_id_lower}", None)
+
         # Disconnect local control client (both variants)
         for key in [node_id, node_id_lower]:
             if key in self._local_ctrl_clients:
@@ -922,61 +1749,6 @@ class ESPHomeAPI:
                     self._local_ctrl_clients.pop(key, None)
 
         _LOGGER.debug("Unregistered device %s", node_id)
-
-    async def send_command(self, cmd: str, node_id: str) -> bool:
-        """Send control command to device."""
-        return await self.set_local_ctrl_property(node_id, "Power", cmd == "on")
-
-    async def send_light_command(self, command_data: dict, node_id: str) -> bool:
-        """Send light control command to device."""
-        if "command" in command_data:
-            cmd = command_data["command"]
-            success = True
-
-            if "power" in cmd:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "Power", cmd["power"]
-                )
-            if "brightness" in cmd:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "Brightness", cmd["brightness"]
-                )
-            if "hue" in cmd:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "Hue", cmd["hue"]
-                )
-            if "saturation" in cmd:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "Saturation", cmd["saturation"]
-                )
-            if "color_temp" in cmd:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "CCT", cmd["color_temp"]
-                )
-
-            return success
-        return False
-
-    async def set_binary_sensor_config(self, node_id: str, config: dict) -> bool:
-        """Set binary sensor configuration."""
-        try:
-            success = True
-            if "device_class" in config:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "device_class", config["device_class"]
-                )
-            if "debounce_time" in config:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "debounce_time", config["debounce_time"]
-                )
-            if "report_interval" in config:
-                success &= await self.set_local_ctrl_property(
-                    node_id, "report_interval", config["report_interval"]
-                )
-            return success
-        except Exception as err:
-            _LOGGER.error("Failed to set binary sensor configuration: %s", err)
-            return False
 
     async def send_device_command(
         self, device_node_id: str, command_type: str, parameters: dict
@@ -1027,13 +1799,23 @@ class ESPHomeAPI:
 
     async def start_services(self, enable_discovery: bool = True) -> None:
         """Start essential background services."""
-        if enable_discovery and not self.devices:
+        # Always start mDNS discovery to detect device reconnection
+        # Even if devices are already known, we need to detect when they come back online
+        if enable_discovery:
+            _LOGGER.info(
+                "🚀 Starting mDNS ServiceBrowser for device discovery and reconnection (enable_discovery=%s, devices=%s)",
+                enable_discovery,
+                list(self.devices.keys()) if self.devices else "empty",
+            )
             self._zc = await zeroconf.async_get_instance(self.hass)
             self._browser = ServiceBrowser(
                 self._zc,
                 "_esp_local_ctrl._tcp.local.",
                 ESPDeviceListener(self.hass, self),
             )
+            _LOGGER.info("✅ mDNS ServiceBrowser started successfully")
+        else:
+            _LOGGER.warning("⚠️ mDNS discovery DISABLED (enable_discovery=False)")
 
         self._monitoring_task = self.hass.async_create_task(
             self._combined_monitoring_loop()
@@ -1159,7 +1941,7 @@ class ESPHomeAPI:
 
         Runs as a background task started by start_services().
         """
-        # ✅ TEMPORARY TEST FLAG: Control polling behavior AFTER initial discovery
+        # TEMPORARY TEST FLAG: Control polling behavior AFTER initial discovery
         # - True = continue periodic queries after discovery
         # - False = stop querying after initial discovery, rely on active reports only
         ENABLE_QUERY_POLLING = False  # ← Change to True to re-enable continuous polling
@@ -1174,7 +1956,7 @@ class ESPHomeAPI:
 
         while True:
             try:
-                # ✅ PHASE 1: Always perform initial discovery for new/reconnected devices
+                # PHASE 1: Always perform initial discovery for new/reconnected devices
                 # This serves as a BACKUP in case the immediate query in update_device() failed.
                 # Reasons a device might need backup discovery:
                 # 1. Device wasn't fully ready when Zeroconf triggered update_device()
@@ -1197,7 +1979,7 @@ class ESPHomeAPI:
                                 err,
                             )
                 
-                # ✅ PHASE 2: Periodic polling (only if enabled AND after initial discovery)
+                # PHASE 2: Periodic polling (only if enabled AND after initial discovery)
                 if ENABLE_QUERY_POLLING:
                     # Continue periodic queries for already-discovered devices
                     for node_id, device_info in list(self.devices.items()):
@@ -1231,8 +2013,27 @@ class ESPHomeAPI:
                     discovery_logged = True
 
                 # Periodically check and maintain connections
+                # Use different intervals for offline vs online devices:
+                # - Offline devices: check every 3 cycles (15 seconds) for faster reconnection
+                # - Online devices: check every 12 cycles (60 seconds) to reduce overhead
                 connection_check_counter += 1
-                if connection_check_counter >= 12:  # CONNECTION_CHECK_CYCLES (60 seconds)
+                
+                # Check if we have any offline devices
+                # We need to check this asynchronously, so collect offline devices first
+                offline_devices = []
+                for node_id in self.devices:
+                    if not self.devices[node_id].get("registered", False):
+                        continue
+                    if node_id in self._local_ctrl_clients:
+                        if not await self._local_ctrl_clients[node_id].is_connected():
+                            offline_devices.append(node_id)
+                
+                has_offline = len(offline_devices) > 0
+                
+                # Use faster check interval if devices are offline
+                check_threshold = 3 if has_offline else 12  # 15s vs 60s
+                
+                if connection_check_counter >= check_threshold:
                     connection_check_counter = 0
                     await self._check_and_reconnect_devices()
 
@@ -1257,6 +2058,13 @@ class ESPHomeAPI:
             port = self.default_port
 
         node_id = str(node_id).replace(":", "").lower()
+        
+        _LOGGER.info(
+            "🔄 update_device called for %s (IP: %s, Port: %s) - triggered by mDNS discovery",
+            node_id,
+            ip,
+            port,
+        )
 
         existing_entries = self.hass.config_entries.async_entries(self.domain)
         for entry in existing_entries:
@@ -1268,42 +2076,47 @@ class ESPHomeAPI:
                     new_data[CONF_HOST] = ip
                     new_data[CONF_PORT] = port
                     self.hass.config_entries.async_update_entry(entry, data=new_data)
+                    _LOGGER.debug(
+                        "Updated config entry for %s: IP %s → %s, Port %s → %s",
+                        node_id,
+                        config_host,
+                        ip,
+                        config_port,
+                        port,
+                    )
                 break
 
-        device_data = {"ip": ip, "port": port, "node_id": node_id, "registered": False}
-        if security_info:
-            device_data["security_info"] = security_info
-
-        self.devices[node_id] = device_data
-
-        with contextlib.suppress(Exception):
-            await self.register_device(node_id, ip, port)
-
-        # Immediate property query is critical to prevent race condition:
-        # ESP32 sends active reports immediately after session establishment.
-        # If these arrive before we know the device structure, decryption fails.
-        # This query must happen as soon as possible after register_device().
-        with contextlib.suppress(Exception):
-            await self.get_local_ctrl_properties(node_id)
-
-    async def get_state(self, node_id: str) -> bool:
-        """Get device state."""
-        if node_id not in self.devices:
-            return False
+        # ✅ FIX: Preserve existing device state when updating
+        # Don't overwrite the entire dict - preserve offline_state and other flags
+        if node_id in self.devices:
+            # Device already exists - update only IP/Port, preserve other state
+            existing_device = self.devices[node_id]
+            existing_device["ip"] = ip
+            existing_device["port"] = port
+            if security_info:
+                existing_device["security_info"] = security_info
+            _LOGGER.debug(
+                "Device %s updated: IP=%s, Port=%s (preserved offline_state=%s, registered=%s)",
+                node_id,
+                ip,
+                port,
+                existing_device.get("offline_state", False),
+                existing_device.get("registered", False),
+            )
+        else:
+            # New device - create fresh entry
+            device_data = {"ip": ip, "port": port, "node_id": node_id, "registered": False}
+            if security_info:
+                device_data["security_info"] = security_info
+            self.devices[node_id] = device_data
+            _LOGGER.debug("Device %s added to devices dict with registered=False", node_id)
 
         try:
-            properties = await self.get_local_ctrl_properties(
-                node_id, skip_discovery=True
-            )
-
-            for prop in properties:
-                if prop.get("device") == "Light" and prop.get("name") == "Power":
-                    return prop.get("value", False)
-
-            return False
-
+            _LOGGER.debug("Calling register_device for %s...", node_id)
+            await self.register_device(node_id, ip, port)
+            _LOGGER.info("✅ Successfully registered device %s", node_id)
         except Exception:
-            return False
+            _LOGGER.exception("❌ Error registering device %s", node_id)
 
     async def _update_device_states(self, node_id: str):
         """Update device states - including lights, sensors and binary sensors."""
@@ -1320,32 +2133,12 @@ class ESPHomeAPI:
             if not properties:
                 return
 
-            for prop in properties:
-                if prop.get("name") != "params":
-                    continue
-
-                try:
-                    if isinstance(prop.get("value"), bytes):
-                        params_str = prop["value"].decode("latin-1")
-                        if not params_str.startswith("{"):
-                            continue
-                        params_data = json.loads(params_str)
-                    elif isinstance(prop.get("value"), str):
-                        params_str = prop["value"]
-                        if not params_str.startswith("{"):
-                            continue
-                        params_data = json.loads(params_str)
-                    elif isinstance(prop.get("value"), dict):
-                        params_data = prop["value"]
-                    else:
-                        continue
-
-                    # Use the coordinator's shared event firing function
-                    fire_property_events(self.hass, self.domain, node_id, params_data)
-                    break
-
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+            # ✅ OPTIMIZED: Reuse _extract_current_values instead of duplicating JSON parsing
+            current_values = self._extract_current_values(properties)
+            
+            if current_values:
+                # Fire property events for all extracted device types
+                fire_property_events(self.hass, self.domain, node_id, current_values)
 
         except Exception:
             pass

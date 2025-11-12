@@ -22,11 +22,7 @@ from homeassistant.core import HomeAssistant
 
 from .esp_iot_spec import (
     BINARY_SENSOR_DEVICE_CLASS_MAP,
-    DEFAULT_ORIENTATION,
-    DEFAULT_SLEEP_STATE,
     DEFAULT_THRESHOLD_ICON,
-    DEFAULT_WAKE_REASON,
-    DEFAULT_WAKE_WINDOW_STATUS,
     ESP32_SENSOR_NAME_MAPPING,
     GESTURE_ICONS,
     GESTURE_PICTURES,
@@ -36,16 +32,12 @@ from .esp_iot_spec import (
     INPUT_TYPE_EVENTS,
     LIGHT_BRIGHTNESS_ESP_MAX,
     LIGHT_BRIGHTNESS_HA_MAX,
-    LIGHT_COLOR_TEMP_MAX_KELVIN,
     LIGHT_COLOR_TEMP_MIN_KELVIN,
     LIGHT_COLOR_TEMP_RANGE_KELVIN,
     NUMBER_RANGE_CONFIGS,
     NUMBER_SENSOR_DISPLAY_NAMES,
     SLEEP_ICON_MAPPING,
-    SLEEP_STATES,
     THRESHOLD_ICON_MAPPING,
-    WAKE_REASONS,
-    WAKE_WINDOW_STATES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -192,6 +184,12 @@ def fire_property_events(
         params_data: Dictionary containing property data from ESP32
     """
     normalized_node_id = str(node_id).replace(":", "").lower()
+    
+    _LOGGER.debug(
+        "Processing property events for device %s with data types: %s",
+        normalized_node_id,
+        list(params_data.keys()),
+    )
 
     # Battery & Energy
     if "Battery & Energy" in params_data:
@@ -327,7 +325,23 @@ def fire_property_events(
 
         for sensor_name, sensor_value in env_data.items():
             if sensor_name in threshold_keys:
+                # Fire threshold update events for Number entities
+                # Instead of skipping, fire threshold_data_received event
+                _LOGGER.debug(
+                    "Firing threshold_data_received event: node=%s, param=%s, value=%s",
+                    normalized_node_id, sensor_name, sensor_value
+                )
+                hass.bus.async_fire(
+                    f"{domain}_threshold_data_received",
+                    {
+                        "node_id": normalized_node_id,
+                        "param_name": sensor_name,
+                        "value": sensor_value,
+                        "timestamp": time.time(),
+                    },
+                )
                 continue
+
             if isinstance(sensor_value, (int, float)):
                 sensor_type = sensor_name.lower().replace(" ", "_")
                 hass.bus.async_fire(
@@ -355,6 +369,10 @@ def fire_property_events(
         bs_data = params_data["Binary Sensor"]
         has_binary_sensor_data = True
         if isinstance(bs_data, dict):
+            # Look for State first (most common case)
+            if "State" in bs_data:
+                bs_state = bs_data["State"]
+            
             # Look for device_class
             if "device_class" in bs_data:
                 device_class = bs_data["device_class"]
@@ -365,11 +383,12 @@ def fire_property_events(
             if "report_interval" in bs_data:
                 report_interval = bs_data["report_interval"]
 
-            # Look for state (boolean values)
-            for key, value in bs_data.items():
-                if isinstance(value, bool) and key.lower() != "device_class":
-                    bs_state = value
-                    break
+            # If no State key, look for any other boolean value
+            if bs_state is None:
+                for key, value in bs_data.items():
+                    if isinstance(value, bool) and key.lower() not in ("device_class", "state"):
+                        bs_state = value
+                        break
         # If bs_data is not a dict, check if it's a boolean
         elif isinstance(bs_data, bool):
             bs_state = bs_data
@@ -497,9 +516,41 @@ def parse_battery_update(battery_data: dict[str, Any]) -> dict[str, Any]:
     if "battery_level" in battery_data and battery_data["battery_level"] is not None:
         result["battery_level"] = int(battery_data["battery_level"])
 
-    # Parse voltage
+    # Parse voltage with validation and unit conversion
     if "voltage" in battery_data and battery_data["voltage"] is not None:
-        result["voltage"] = float(battery_data["voltage"])
+        raw_voltage = float(battery_data["voltage"])
+        
+        # Detect and handle unreasonable voltage values
+        # Valid Li-ion battery range: 2.5V - 4.5V
+        # If voltage is outside this range, assume it's in millivolts or corrupted
+        if raw_voltage > 1000:
+            # Likely millivolts - convert to volts
+            voltage = raw_voltage / 1000.0
+            _LOGGER.debug(
+                "Converted voltage from millivolts: %.0f mV -> %.2f V",
+                raw_voltage,
+                voltage,
+            )
+        elif raw_voltage < 0 or raw_voltage > 100:
+            # Corrupted or invalid data
+            _LOGGER.warning(
+                "Invalid battery voltage detected: %.2f V (ignoring - outside valid range)",
+                raw_voltage,
+            )
+            voltage = None
+        else:
+            voltage = raw_voltage
+        
+        # Final validation: ensure voltage is in reasonable range (2.0V - 5.0V)
+        if voltage is not None and (voltage < 2.0 or voltage > 5.0):
+            _LOGGER.warning(
+                "Battery voltage out of safe range: %.2f V (expected 2.0-5.0V, ignoring)",
+                voltage,
+            )
+            voltage = None
+        
+        if voltage is not None:
+            result["voltage"] = voltage
 
     # Parse temperature
     if "temperature" in battery_data and battery_data["temperature"] is not None:
@@ -592,113 +643,6 @@ def get_gesture_icon(gesture: str, power: bool = True) -> str:
     if not power:
         return "mdi:gesture-tap-hold"
     return GESTURE_ICONS.get(gesture, "mdi:gesture-tap")
-
-
-def parse_gesture_update(sensor_data: dict, current_gesture: str) -> dict:
-    """Parse gesture sensor data from update event.
-
-    Args:
-        sensor_data: Raw sensor data from ESP device
-        current_gesture: Current gesture state (for event-based updates)
-
-    Returns:
-        Dictionary containing parsed gesture data with keys:
-        - gesture: Detected gesture type
-        - confidence: Gesture confidence level (0-100)
-        - orientation: Dict with x, y, z orientation values
-        - orientation_change: Orientation change state
-        - power: Power state
-        - push_event: Push event flag
-        - shake_event: Shake event flag
-        - circle_event: Circle event flag
-        - flip_event: Flip event flag
-        - toss_event: Toss event flag
-        - rotation_event: Rotation event flag
-        - sensitivity: Gesture sensitivity level (0-100)
-    """
-    result = {
-        "gesture": current_gesture,
-        "confidence": 0,
-        "orientation": DEFAULT_ORIENTATION.copy(),
-        "orientation_change": "normal",
-        "power": True,
-        "push_event": False,
-        "shake_event": False,
-        "circle_event": False,
-        "flip_event": False,
-        "toss_event": False,
-        "rotation_event": False,
-        "sensitivity": 50,
-    }
-
-    # Handle gesture type update
-    if "gesture_type" in sensor_data and sensor_data["gesture_type"] is not None:
-        gesture_type = sensor_data["gesture_type"]
-        if gesture_type in GESTURE_STATES:
-            result["gesture"] = gesture_type
-
-    # Update confidence
-    if (
-        "gesture_confidence" in sensor_data
-        and sensor_data["gesture_confidence"] is not None
-    ):
-        result["confidence"] = int(sensor_data["gesture_confidence"])
-
-    # Update orientation
-    if "x_orientation" in sensor_data and sensor_data["x_orientation"] is not None:
-        result["orientation"]["x"] = float(sensor_data["x_orientation"])
-    if "y_orientation" in sensor_data and sensor_data["y_orientation"] is not None:
-        result["orientation"]["y"] = float(sensor_data["y_orientation"])
-    if "z_orientation" in sensor_data and sensor_data["z_orientation"] is not None:
-        result["orientation"]["z"] = float(sensor_data["z_orientation"])
-
-    # Update orientation change
-    if (
-        "orientation_change" in sensor_data
-        and sensor_data["orientation_change"] is not None
-    ):
-        result["orientation_change"] = sensor_data["orientation_change"]
-
-    # Update power state
-    if "power" in sensor_data and sensor_data["power"] is not None:
-        result["power"] = bool(sensor_data["power"])
-
-    # Update event flags and set gesture if event detected
-    if "shake_event" in sensor_data and sensor_data["shake_event"] is not None:
-        result["shake_event"] = bool(sensor_data["shake_event"])
-        if result["shake_event"]:
-            result["gesture"] = "shake"
-
-    if "push_event" in sensor_data and sensor_data["push_event"] is not None:
-        result["push_event"] = bool(sensor_data["push_event"])
-        if result["push_event"]:
-            result["gesture"] = "push"
-
-    if "circle_event" in sensor_data and sensor_data["circle_event"] is not None:
-        result["circle_event"] = bool(sensor_data["circle_event"])
-        if result["circle_event"]:
-            result["gesture"] = "circle"
-
-    if "flip_event" in sensor_data and sensor_data["flip_event"] is not None:
-        result["flip_event"] = bool(sensor_data["flip_event"])
-        if result["flip_event"]:
-            result["gesture"] = "flip"
-
-    if "toss_event" in sensor_data and sensor_data["toss_event"] is not None:
-        result["toss_event"] = bool(sensor_data["toss_event"])
-        if result["toss_event"]:
-            result["gesture"] = "toss"
-
-    if "rotation_event" in sensor_data and sensor_data["rotation_event"] is not None:
-        result["rotation_event"] = bool(sensor_data["rotation_event"])
-        if result["rotation_event"]:
-            result["gesture"] = "rotation"
-
-    # Update sensitivity
-    if "sensitivity" in sensor_data and sensor_data["sensitivity"] is not None:
-        result["sensitivity"] = int(sensor_data["sensitivity"])
-
-    return result
 
 
 def check_gesture_pictures_available(component_path) -> bool:
@@ -1071,114 +1015,6 @@ def get_sleep_icon(sleep_state: str) -> str:
         Material Design icon identifier
     """
     return SLEEP_ICON_MAPPING.get(sleep_state, "mdi:help-circle")
-
-
-def get_sleep_state_text(sleep_state: str) -> str:
-    """Get human-readable text for sleep state.
-
-    Args:
-        sleep_state: Sleep state key
-
-    Returns:
-        Human-readable sleep state description
-    """
-    return SLEEP_STATES.get(sleep_state, "Unknown")
-
-
-def get_wake_reason_text(wake_reason: str) -> str:
-    """Get human-readable text for wake reason.
-
-    Args:
-        wake_reason: Wake reason key
-
-    Returns:
-        Human-readable wake reason description
-    """
-    return WAKE_REASONS.get(wake_reason, "Unknown")
-
-
-def get_wake_window_text(wake_window_status: str) -> str:
-    """Get human-readable text for wake window status.
-
-    Args:
-        wake_window_status: Wake window status key
-
-    Returns:
-        Human-readable wake window status description
-    """
-    return WAKE_WINDOW_STATES.get(wake_window_status, "Unknown")
-
-
-def parse_sleep_update(
-    sleep_data: dict[str, Any],
-    current_state: dict[str, Any],
-) -> dict[str, Any]:
-    """Parse sleep update data and return state changes.
-
-    Args:
-        sleep_data: Sleep update data from device
-        current_state: Current sleep state with keys:
-            - sleep_state, wake_reason, wake_window_status,
-              sleep_duration, wake_count, last_wake_time
-
-    Returns:
-        Dictionary with updated sleep state attributes
-    """
-    state_update = {}
-    old_sleep_state = current_state.get("sleep_state", DEFAULT_SLEEP_STATE)
-
-    # Update sleep state
-    if "sleep_state" in sleep_data and sleep_data["sleep_state"] is not None:
-        state_update["sleep_state"] = sleep_data["sleep_state"]
-    else:
-        state_update["sleep_state"] = old_sleep_state
-
-    # Update wake reason
-    if "wake_reason" in sleep_data and sleep_data["wake_reason"] is not None:
-        state_update["wake_reason"] = sleep_data["wake_reason"]
-    else:
-        state_update["wake_reason"] = current_state.get(
-            "wake_reason", DEFAULT_WAKE_REASON
-        )
-
-    # Update wake window status
-    if (
-        "wake_window_status" in sleep_data
-        and sleep_data["wake_window_status"] is not None
-    ):
-        state_update["wake_window_status"] = sleep_data["wake_window_status"]
-    else:
-        state_update["wake_window_status"] = current_state.get(
-            "wake_window_status", DEFAULT_WAKE_WINDOW_STATUS
-        )
-
-    # Update sleep duration
-    if "sleep_duration" in sleep_data and sleep_data["sleep_duration"] is not None:
-        state_update["sleep_duration"] = int(sleep_data["sleep_duration"])
-    else:
-        state_update["sleep_duration"] = current_state.get("sleep_duration", 0)
-
-    # Update wake count - use ESP32's value if provided, otherwise calculate locally
-    current_wake_count = current_state.get("wake_count", 0)
-    if "wake_count" in sleep_data and sleep_data["wake_count"] is not None:
-        wake_count = int(sleep_data["wake_count"])
-    else:
-        # Calculate wake count locally on state transition
-        wake_count = current_wake_count
-        if old_sleep_state != "awake" and state_update["sleep_state"] == "awake":
-            wake_count += 1
-
-    state_update["wake_count"] = wake_count
-
-    # Update last wake time if wake count increased
-    if wake_count > current_wake_count:
-        state_update["last_wake_time"] = time.time()
-    else:
-        state_update["last_wake_time"] = current_state.get("last_wake_time", time.time())
-
-    state_update["last_update"] = time.time()
-
-    return state_update
 
 
 # ============================================================================

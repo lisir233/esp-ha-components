@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, get_device_info
 from .esp_iot import (
@@ -39,19 +40,13 @@ class ESPHomeIMUGesture(SensorEntity):
         self._device_name = device_name
 
         # Entity attributes
-        self._attr_has_entity_name = True
         self._attr_name = "IMU Gesture"
-        self._attr_icon = "mdi:gesture-tap"
         self._attr_unique_id = f"{DOMAIN}_{self._node_id}_imu_gesture"
         self._attr_device_info = get_device_info(node_id, device_name)
 
-        # State
+        # Core attributes
         self._gesture = "idle"
         self._confidence = 0
-        self._orientation = {"x": 0.0, "y": 0.0, "z": 0.0}
-        self._orientation_change = "normal"
-        self._power = True
-
         # Event states (boolean flags for different gesture events)
         self._push_event = False
         self._shake_event = False
@@ -60,17 +55,13 @@ class ESPHomeIMUGesture(SensorEntity):
         self._toss_event = False
         self._rotation_event = False
 
-        # Configuration
-        self._sensitivity = 50
+        # Internal timer duration
+        self._gesture_display_duration = 2.0
+        self._reset_timer = None
 
         # Picture support
-        # 图片支持 - 检查图片文件夹是否存在
         component_path = Path(__file__).parent
         self._use_pictures = check_gesture_pictures_available(component_path)
-        # Don't set entity_picture - only use small icons by default
-        # Pictures are accessed via extra_state_attributes for dashboard use only
-        # 不设置entity_picture - 默认只使用小图标
-        # 图片通过extra_state_attributes访问，仅用于Dashboard
         self._attr_entity_picture = None
 
         _LOGGER.debug(
@@ -91,7 +82,70 @@ class ESPHomeIMUGesture(SensorEntity):
             )
         )
 
-    @callback
+        # Subscribe to device availability changes
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                f"{DOMAIN}_device_availability_changed",
+                self._handle_device_availability_change,
+            )
+        )
+
+    def _cancel_reset_timer(self) -> None:
+        """Cancel the existing reset timer if any."""
+        if self._reset_timer is not None and not self._reset_timer.done():
+            self._reset_timer.cancel()
+            self._reset_timer = None
+            _LOGGER.debug("Cancelled gesture reset timer")
+
+    async def _auto_reset_to_idle(self) -> None:
+        """Automatically reset gesture to idle after gesture_display_duration."""
+        try:
+            await asyncio.sleep(self._gesture_display_duration)
+            _LOGGER.info(
+                "Auto-resetting gesture to idle after %.1fs (was: %s)",
+                self._gesture_display_duration,
+                self._gesture,
+            )
+            self._gesture = "idle"
+            self._confidence = 0
+            self._push_event = False
+            self._shake_event = False
+            self._circle_event = False
+            self._flip_event = False
+            self._toss_event = False
+            self._rotation_event = False
+            
+            self.async_write_ha_state()
+            _LOGGER.debug(
+                "Reset all event flags to False after %.1fs",
+                self._gesture_display_duration,
+            )
+        except asyncio.CancelledError:
+            _LOGGER.debug("Gesture reset timer cancelled")
+        except Exception as err:  # Broad exception acceptable for background task
+            _LOGGER.error("Error in auto-reset timer: %s", err)
+
+    async def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change (offline/online) - update entity state."""
+        try:
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+
+            if event_node_id == self._node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating IMU gesture entity %s",
+                    event_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
+
     async def _handle_gesture_update(self, event) -> None:
         """Handle gesture update events."""
         event_data = event.data
@@ -128,12 +182,45 @@ class ESPHomeIMUGesture(SensorEntity):
             # ESP32 sends parameters one by one, so we need to update only the fields that are present
             # 因为 ESP32 逐个发送参数，所以我们只更新存在的字段，保留其他字段的当前值
             
+            # Check for gesture_display_duration parameter from ESP32
+            # 检查 ESP32 的手势显示持续时间参数
+            if "gesture_display_duration" in sensor_data and sensor_data["gesture_display_duration"] is not None:
+                try:
+                    self._gesture_display_duration = float(sensor_data["gesture_display_duration"])
+                    _LOGGER.info(
+                        "Updated gesture display duration: %.1fs",
+                        self._gesture_display_duration,
+                    )
+                except (ValueError, TypeError):
+                    _LOGGER.warning(
+                        "Invalid gesture_display_duration value: %s",
+                        sensor_data["gesture_display_duration"],
+                    )
+
             # Update gesture type
             if "gesture_type" in sensor_data and sensor_data["gesture_type"] is not None:
                 gesture_type = sensor_data["gesture_type"]
+                # Treat "none" as "idle" since they both represent no active gesture
+                if gesture_type == "none":
+                    gesture_type = "idle"
                 if gesture_type in ["idle", "shake", "push", "circle", "flip", "toss", "rotation"]:
+                    old_gesture = self._gesture
                     self._gesture = gesture_type
-                    _LOGGER.info("Updated gesture type: %s", self._gesture)
+                    _LOGGER.info("Updated gesture type: %s -> %s", old_gesture, self._gesture)
+                    
+                    # Start auto-reset timer for non-idle gestures
+                    # 为非 idle 手势启动自动重置定时器
+                    if self._gesture != "idle":
+                        self._cancel_reset_timer()  # Cancel any existing timer
+                        self._reset_timer = asyncio.create_task(self._auto_reset_to_idle())
+                        _LOGGER.info(
+                            "Started auto-reset timer for gesture '%s' (%.1fs)",
+                            self._gesture,
+                            self._gesture_display_duration,
+                        )
+                    else:
+                        # If gesture is idle, cancel any pending reset timer
+                        self._cancel_reset_timer()
             
             # Update confidence
             if "gesture_confidence" in sensor_data and sensor_data["gesture_confidence"] is not None:
@@ -141,67 +228,96 @@ class ESPHomeIMUGesture(SensorEntity):
                 self._confidence = int(sensor_data["gesture_confidence"])
                 _LOGGER.info("Updated confidence: %d -> %d", old_confidence, self._confidence)
             
-            # Update orientation (individual axes)
+            # Update orientation (individual axes) - Extended attributes
             if "x_orientation" in sensor_data and sensor_data["x_orientation"] is not None:
-                self._orientation["x"] = float(sensor_data["x_orientation"])
-                _LOGGER.debug("Updated X orientation: %.2f", self._orientation["x"])
-            
+                self._orientation_x = float(sensor_data["x_orientation"])
+                _LOGGER.debug("Updated X orientation: %.2f", self._orientation_x)
+
             if "y_orientation" in sensor_data and sensor_data["y_orientation"] is not None:
-                self._orientation["y"] = float(sensor_data["y_orientation"])
-                _LOGGER.debug("Updated Y orientation: %.2f", self._orientation["y"])
-            
+                self._orientation_y = float(sensor_data["y_orientation"])
+                _LOGGER.debug("Updated Y orientation: %.2f", self._orientation_y)
+
             if "z_orientation" in sensor_data and sensor_data["z_orientation"] is not None:
-                self._orientation["z"] = float(sensor_data["z_orientation"])
-                _LOGGER.debug("Updated Z orientation: %.2f", self._orientation["z"])
-            
-            # Update orientation change
+                self._orientation_z = float(sensor_data["z_orientation"])
+                _LOGGER.debug("Updated Z orientation: %.2f", self._orientation_z)
+
+            # Update orientation change - Extended attribute
             if "orientation_change" in sensor_data and sensor_data["orientation_change"] is not None:
                 self._orientation_change = sensor_data["orientation_change"]
                 _LOGGER.info("Updated orientation change: %s", self._orientation_change)
-            
-            # Update power state
+
+            # Update power state - Extended attribute
             if "power" in sensor_data and sensor_data["power"] is not None:
                 self._power = bool(sensor_data["power"])
                 _LOGGER.info("Updated power: %s", self._power)
             
             # Update event flags
+            # When an event is triggered, also start the auto-reset timer
+            # IMPORTANT: Only set flags to True when ESP32 reports True
+            # Ignore False values from ESP32 - let the auto-reset timer handle resetting to False
+            # 重要：只在 ESP32 上报 True 时设置标志位为 True
+            # 忽略 ESP32 发来的 False 值 - 让自动重置定时器负责将标志位重置为 False
+            gesture_triggered = False
+            
             if "shake_event" in sensor_data and sensor_data["shake_event"] is not None:
-                self._shake_event = bool(sensor_data["shake_event"])
-                if self._shake_event:
+                event_value = bool(sensor_data["shake_event"])
+                if event_value:  # Only process True events
+                    self._shake_event = True
                     self._gesture = "shake"
-                _LOGGER.info("Updated shake event: %s", self._shake_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Shake event triggered")
             
             if "push_event" in sensor_data and sensor_data["push_event"] is not None:
-                self._push_event = bool(sensor_data["push_event"])
-                if self._push_event:
+                event_value = bool(sensor_data["push_event"])
+                if event_value:  # Only process True events
+                    self._push_event = True
                     self._gesture = "push"
-                _LOGGER.info("Updated push event: %s", self._push_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Push event triggered")
             
             if "circle_event" in sensor_data and sensor_data["circle_event"] is not None:
-                self._circle_event = bool(sensor_data["circle_event"])
-                if self._circle_event:
+                event_value = bool(sensor_data["circle_event"])
+                if event_value:  # Only process True events
+                    self._circle_event = True
                     self._gesture = "circle"
-                _LOGGER.info("Updated circle event: %s", self._circle_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Circle event triggered")
             
             if "flip_event" in sensor_data and sensor_data["flip_event"] is not None:
-                self._flip_event = bool(sensor_data["flip_event"])
-                if self._flip_event:
+                event_value = bool(sensor_data["flip_event"])
+                if event_value:  # Only process True events
+                    self._flip_event = True
                     self._gesture = "flip"
-                _LOGGER.info("Updated flip event: %s", self._flip_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Flip event triggered")
             
             if "toss_event" in sensor_data and sensor_data["toss_event"] is not None:
-                self._toss_event = bool(sensor_data["toss_event"])
-                if self._toss_event:
+                event_value = bool(sensor_data["toss_event"])
+                if event_value:  # Only process True events
+                    self._toss_event = True
                     self._gesture = "toss"
-                _LOGGER.info("Updated toss event: %s", self._toss_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Toss event triggered")
             
             if "rotation_event" in sensor_data and sensor_data["rotation_event"] is not None:
-                self._rotation_event = bool(sensor_data["rotation_event"])
-                if self._rotation_event:
+                event_value = bool(sensor_data["rotation_event"])
+                if event_value:  # Only process True events
+                    self._rotation_event = True
                     self._gesture = "rotation"
-                _LOGGER.info("Updated rotation event: %s", self._rotation_event)
+                    gesture_triggered = True
+                    _LOGGER.info("Rotation event triggered")
             
-            # Update sensitivity
+            # Start auto-reset timer if a gesture event was triggered
+            if gesture_triggered:
+                self._cancel_reset_timer()
+                self._reset_timer = asyncio.create_task(self._auto_reset_to_idle())
+                _LOGGER.info(
+                    "Started auto-reset timer for event-triggered gesture '%s' (%.1fs)",
+                    self._gesture,
+                    self._gesture_display_duration,
+                )
+            
+            # Update sensitivity - Extended attribute
             if "sensitivity" in sensor_data and sensor_data["sensitivity"] is not None:
                 self._sensitivity = int(sensor_data["sensitivity"])
                 _LOGGER.info("Updated sensitivity: %d", self._sensitivity)
@@ -212,11 +328,6 @@ class ESPHomeIMUGesture(SensorEntity):
             # 图片URL通过extra_state_attributes提供给Dashboard使用
 
             self.async_write_ha_state()
-            _LOGGER.info(
-                "IMU Gesture state updated: gesture=%s, confidence=%d%%",
-                self._gesture,
-                self._confidence,
-            )
 
         except Exception:  # Broad exception acceptable for callback event handling
             _LOGGER.exception("Failed to process gesture update")
@@ -224,32 +335,56 @@ class ESPHomeIMUGesture(SensorEntity):
     @property
     def native_value(self) -> str:
         """Return current gesture state."""
-        return get_gesture_display_name(self._gesture, self._power)
+        power = getattr(self, "_power", True)  # Default to True if not set
+        return get_gesture_display_name(self._gesture, power)
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self._hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
 
     @property
     def icon(self) -> str:
         """Return icon based on current gesture."""
-        return get_gesture_icon(self._gesture, self._power)
+        power = getattr(self, "_power", True)  # Default to True if not set
+        return get_gesture_icon(self._gesture, power)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional state attributes."""
-        # Show ESP32 parameters only
-        return {
-            # Core gesture data from ESP32
+        attrs = {
             "gesture": self._gesture,
             "confidence": self._confidence,
-            "orientation_x": self._orientation["x"],
-            "orientation_y": self._orientation["y"],
-            "orientation_z": self._orientation["z"],
-            "orientation_change": self._orientation_change,
-            # Event flags from ESP32
             "push_event": self._push_event,
             "shake_event": self._shake_event,
             "circle_event": self._circle_event,
             "flip_event": self._flip_event,
             "toss_event": self._toss_event,
             "rotation_event": self._rotation_event,
-            # Configuration from ESP32
-            "sensitivity": self._sensitivity,
         }
+
+        if hasattr(self, "_orientation_x"):
+            attrs["orientation_x"] = self._orientation_x
+
+        if hasattr(self, "_orientation_y"):
+            attrs["orientation_y"] = self._orientation_y
+
+        if hasattr(self, "_orientation_z"):
+            attrs["orientation_z"] = self._orientation_z
+
+        if hasattr(self, "_orientation_change"):
+            attrs["orientation_change"] = self._orientation_change
+
+        if hasattr(self, "_sensitivity"):
+            attrs["sensitivity"] = self._sensitivity
+
+        if hasattr(self, "_gesture_display_duration") and self._gesture_display_duration != 2.0:
+            attrs["gesture_display_duration"] = self._gesture_display_duration
+
+        if hasattr(self, "_power"):
+            attrs["power"] = self._power
+
+        return attrs

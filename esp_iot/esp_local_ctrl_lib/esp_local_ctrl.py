@@ -383,8 +383,7 @@ async def get_transport(sel_transport, service_name, check_hostname):
 
 async def get_sec_patch_ver(tp, verbose=False):
     try:
-        # ✅ 使用 send_data_and_receive() 而不是 send_data()
-        # 因为这是 setup 阶段，在 HTTPMessageListener 启动前
+        # Use send_data_and_receive() during setup phase before HTTPMessageListener starts
         response = await tp.send_data_and_receive("esp_local_ctrl/version", "---")
 
         if verbose:
@@ -411,7 +410,7 @@ async def get_sec_patch_ver(tp, verbose=False):
 
 async def version_match(tp, protover, verbose=False):
     try:
-        # ✅ 使用 send_data_and_receive() 而不是 send_data()
+        # Use send_data_and_receive() during setup phase
         response = await tp.send_data_and_receive("esp_local_ctrl/version", protover)
 
         if verbose:
@@ -443,7 +442,7 @@ async def has_capability(tp, capability="none", verbose=False):
     # Note : default value of `capability` argument cannot be empty string
     # because protocomm_httpd expects non zero content lengths
     try:
-        # ✅ 使用 send_data_and_receive() 而不是 send_data()
+        # Use send_data_and_receive() during setup phase
         response = await tp.send_data_and_receive("esp_local_ctrl/version", capability)
 
         if verbose:
@@ -482,14 +481,14 @@ async def has_capability(tp, capability="none", verbose=False):
 
 
 async def establish_session(tp, sec):
-    """建立安全会话（Session Handshake）
+    """Establish secure session (Session Handshake).
 
-    ✅ 使用 send_data_and_receive() 进行多轮握手
-    握手在 HTTPMessageListener 启动前进行
-    所以可以安全地使用 conn.getresponse() 获取响应
+    Uses send_data_and_receive() for multi-round handshake.
+    Handshake occurs before HTTPMessageListener starts,
+    so it's safe to use conn.getresponse() to get response.
 
-    ⚠️ 握手完成后，transport 中的 socket 可能被污染
-    调用者需要在启动 HTTPMessageListener 前调用 reset_connection()
+    Warning: After handshake completes, the socket in transport may be polluted.
+    Caller needs to call reset_connection() before starting HTTPMessageListener.
     """
     try:
         response = None
@@ -539,16 +538,18 @@ class HTTPMessageListener:
     Supports waiting for specific query responses while routing active reports to callbacks.
     """
 
-    def __init__(self, transport, security_ctx, verbose=False):
+    def __init__(self, transport, security_ctx, client=None, verbose=False):
         """Initialize HTTP message listener.
 
         Args:
             transport: ESP-IDF transport object with socket
             security_ctx: Security context for decryption
+            client: Optional ESPLocalCtrlClient to notify of connection errors
             verbose: Enable verbose logging
         """
         self.transport = transport
         self.security_ctx = security_ctx
+        self.client = client  # Store client reference for error notification
         self.verbose = verbose
         self.callbacks = []
         self._running = False
@@ -665,21 +666,47 @@ class HTTPMessageListener:
                     break
 
                 # Receive data with timeout
+                # ⚠️ IMPORTANT: Timeout handling strategy
+                # - TCP keepalive works at kernel level (invisible to recv())
+                # - recv() only returns APPLICATION data, NOT keepalive ACKs
+                # - If ESP32 doesn't send data for 60s, recv() timeout is NORMAL
+                # - Only socket errors (RST, connection closed) indicate real problems
+                #
+                # Timeout Strategy:
+                # - Use 60s timeout (long enough for normal idle periods)
+                # - Timeout is NORMAL - just continue waiting
+                # - Only mark error for SOCKET EXCEPTIONS (RST, closed, etc.)
                 try:
                     data = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(None, sock.recv, 4096),
                         timeout=60.0,
                     )
-                except TimeoutError:
-                    # Timeout is normal, continue waiting for data from device
+                except asyncio.TimeoutError:
+                    # ✅ Timeout is NORMAL when ESP32 is idle (no active reports)
+                    # TCP keepalive maintains connection in background (invisible to recv)
+                    # Do NOT mark as error - just continue waiting
                     continue
+                except (ConnectionResetError, ConnectionRefusedError, BrokenPipeError, OSError) as e:
+                    # ✅ CRITICAL: Real socket errors (RST, connection closed, etc.)
+                    # These indicate the connection is actually broken
+                    if self.client and hasattr(self.client, 'mark_connection_error'):
+                        self.client.mark_connection_error()
+                    # Cancel all waiting queries immediately
+                    await self._cancel_all_queries()
+                    break  # Stop listener immediately on socket error
                 except Exception as e:
-                    print(f"[DEBUG] Listener: Socket receive error: {e}")
+                    # ⚠️ Unexpected errors - log but don't mark connection as failed
+                    # This could be asyncio cancellation or other issues
                     await asyncio.sleep(1.0)
                     continue
 
                 if not data:
                     print("[DEBUG] Listener: Socket closed by remote peer")
+                    # ✅ CRITICAL: Notify client of connection closure
+                    # Only mark if not already marked (avoid duplicate warnings)
+                    if self.client and hasattr(self.client, 'mark_connection_error'):
+                        if not getattr(self.client, '_connection_error', False):
+                            self.client.mark_connection_error()
                     break
 
                 print(f"[DEBUG] Listener: Received {len(data)} bytes from socket")
@@ -743,9 +770,6 @@ class HTTPMessageListener:
                         )
                         async with self._buffer_lock:
                             self._buffer = bytearray(self._buffer[6:])
-                        print(
-                            f"[DEBUG] _process_buffer: Buffer after removal: {len(self._buffer)} bytes"
-                        )
                         # Continue to routing (skip message size calculation for headerless response)
                     else:
                         error_count = (
@@ -869,6 +893,13 @@ class HTTPMessageListener:
                     callback(msg_source, data)
             except Exception as e:
                 print(f"Error in callback: {e}")
+
+    async def _cancel_all_queries(self):
+        """Cancel all waiting queries (called when connection error detected)."""
+        for query_id, future in list(self._query_futures.items()):
+            if not future.done():
+                future.set_exception(ConnectionError("Connection lost"))
+        self._query_futures.clear()
 
     def _get_socket(self):
         """Extract socket from transport."""

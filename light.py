@@ -32,7 +32,6 @@ from .esp_iot import (
 
 _LOGGER = logging.getLogger(__name__)
 
-
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigType,
@@ -60,7 +59,7 @@ async def async_setup_entry(
     async def handle_light_discovered(event) -> None:
         """Handle light device discovery."""
         try:
-            event_node_id = str(event.data.get("node_id", "")).lower()
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
             device_name = event.data.get("device_name", "")
             light_params = event.data.get("light_params", {})
 
@@ -95,7 +94,6 @@ async def async_setup_entry(
 
     async_add_entities(entities)
 
-
 class ESPHomeLight(LightEntity):
     """ESP-RainMaker light entity."""
 
@@ -122,8 +120,8 @@ class ESPHomeLight(LightEntity):
 
         node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
 
-        self._attr_name = "Light"  # Simple name, HA combines with device name
-        self._attr_has_entity_name = True  # Enable automatic naming
+        self._attr_name = "Light"
+        self._attr_has_entity_name = True
         if is_discovery:
             self._attr_unique_id = f"{DOMAIN}_{node_id}_light"
         else:
@@ -166,9 +164,14 @@ class ESPHomeLight(LightEntity):
         return f"Mode {self._light_mode}"
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        node_id = str(self._device_info["node_id"]).lower()
+        return self._api.is_device_available(node_id)
+
+    @property
     def extra_state_attributes(self) -> dict[str, any]:
-        """Return additional state attributes showing ESP32 light parameters."""
-        # Always show ESP32 reported data - CCT value is preserved unless explicitly updated
+        """Return additional state attributes."""
         return {
             "intensity": self._intensity,
             "light_mode": self._light_mode,
@@ -183,16 +186,45 @@ class ESPHomeLight(LightEntity):
             f"{DOMAIN}_light_update", self._handle_light_update
         )
 
+        # Subscribe to device availability changes
+        self._unsub_availability = self.hass.bus.async_listen(
+            f"{DOMAIN}_device_availability_changed", self._handle_device_availability_change
+        )
+
     async def async_will_remove_from_hass(self) -> None:
         """Clean up resources."""
         if self._unsub_update:
             self._unsub_update()
+        if self._unsub_availability:
+            self._unsub_availability()
+
+    async def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change - update entity state."""
+        try:
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+            device_node_id = str(self._device_info["node_id"]).replace(":", "").lower()
+
+            if event_node_id == device_node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating light %s",
+                    device_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
 
     async def _handle_light_update(self, event) -> None:
         """Handle light state updates."""
         try:
-            event_id = str(event.data.get("node_id", "")).lower()
-            device_id = str(self._device_info["node_id"]).lower()
+            event_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+            device_id = str(self._device_info["node_id"]).replace(":", "").lower()
 
             if event_id != device_id:
                 return
@@ -211,9 +243,13 @@ class ESPHomeLight(LightEntity):
 
             self._update_state_from_data(light_data)
 
+            # Always update state to ensure entity shows as available after reconnection
+            # Even if values haven't changed, we need to update availability
+            self.async_write_ha_state()
+
             new_state = self._get_current_state()
             if old_state != new_state:
-                self.async_write_ha_state()
+                _LOGGER.debug("Light state changed from %s to %s", old_state, new_state)
 
         except Exception:
             _LOGGER.exception("Failed to handle light update")

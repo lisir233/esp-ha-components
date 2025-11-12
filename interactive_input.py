@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, get_device_info
 from .esp_iot import (
@@ -47,21 +47,13 @@ class ESPHomeInteractiveInput(SensorEntity):
         self._attr_should_poll = False
         self._attr_device_class = SensorDeviceClass.ENUM  # Use enum type
         self._attr_state_class = None  # Enum type doesn't need state class
-        self._attr_native_unit_of_measurement = None  # Enum type doesn't need unit
+        self._attr_native_unit_of_measurement = None
 
-        # Initialize state with instance variables
+        # Core attributes
         self._attr_native_value = "none"
-        self._current_state = {
-            "input_type": "button",
-            "last_event": "none",
-            "current_value": 0.0,
-            "input_config": {},
-            "input_mapping": {},
-            "sensitivity": 50,
-            "node_id": self._node_id,
-            "device_name": self._device_name,
-            "last_update": time.time(),
-        }
+        self._input_type = "button"
+        self._input_events = "none"
+        self._last_update = time.time()
 
         # Device information
         self._attr_device_info = get_device_info(self._node_id, device_name)
@@ -89,6 +81,11 @@ class ESPHomeInteractiveInput(SensorEntity):
                     f"{DOMAIN}_interactive_input_controller_update",
                     self._handle_ha_bus_event,
                 ),
+                # Subscribe to device availability changes
+                self.hass.bus.async_listen(
+                    f"{DOMAIN}_device_availability_changed",
+                    self._handle_device_availability_change,
+                ),
             ]
         )
 
@@ -97,9 +94,15 @@ class ESPHomeInteractiveInput(SensorEntity):
     @property
     def icon(self) -> str:
         """Return the icon for the entity."""
-        input_type = self._current_state.get("input_type", "button")
-        last_event = self._current_state.get("last_event", "none")
-        return get_input_icon(input_type, last_event)
+        return get_input_icon(self._input_type, self._input_events)
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self._hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
 
     async def async_will_remove_from_hass(self) -> None:
         """When entity will be removed from hass."""
@@ -110,7 +113,27 @@ class ESPHomeInteractiveInput(SensorEntity):
 
         await super().async_will_remove_from_hass()
 
-    @callback
+    async def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change (offline/online) - update entity state."""
+        try:
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+
+            if event_node_id == self._node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating interactive input entity %s",
+                    event_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
+
     async def _handle_ha_bus_event(self, event) -> None:
         """Handle Home Assistant bus events for ESP32 updates."""
         event_data = event.data
@@ -157,13 +180,34 @@ class ESPHomeInteractiveInput(SensorEntity):
 
             # Apply updates to state
             if updates:
-                updates["last_update"] = time.time()
-                self._current_state.update(updates)
+                self._last_update = time.time()
 
-                # Update entity's native value
-                self._attr_native_value = updates.get(
-                    "last_event", self._current_state.get("last_event", "none")
-                )
+                # Update core attributes (必选)
+                if "input_type" in updates:
+                    self._input_type = updates["input_type"]
+                    _LOGGER.info("Updated input_type: %s", self._input_type)
+
+                if "last_event" in updates:
+                    self._input_events = updates["last_event"]
+                    self._attr_native_value = updates["last_event"]
+                    _LOGGER.info("Updated input_events: %s", self._input_events)
+
+                # Update extended attributes (可选)
+                if "current_value" in updates:
+                    self._input_value = updates["current_value"]
+                    _LOGGER.debug("Updated input_value: %.2f", self._input_value)
+
+                if "sensitivity" in updates:
+                    self._sensitivity = updates["sensitivity"]
+                    _LOGGER.info("Updated sensitivity: %d", self._sensitivity)
+
+                if "input_config" in updates:
+                    self._input_config = updates["input_config"]
+                    _LOGGER.debug("Updated input_config: %s", self._input_config)
+
+                if "input_mapping" in updates:
+                    self._input_mapping = updates["input_mapping"]
+                    _LOGGER.debug("Updated input_mapping: %s", self._input_mapping)
 
                 _LOGGER.info("Interactive input state updated from ESP32: %s", updates)
 
@@ -180,13 +224,28 @@ class ESPHomeInteractiveInput(SensorEntity):
 
             # Apply updates
             if updates:
-                updates["last_update"] = time.time()
-                self._current_state.update(updates)
+                self._last_update = time.time()
 
-                # Update entity's native value
-                self._attr_native_value = updates.get(
-                    "last_event", self._current_state.get("last_event", "none")
-                )
+                # Update core attributes (必选)
+                if "input_type" in updates:
+                    self._input_type = updates["input_type"]
+
+                if "last_event" in updates:
+                    self._input_events = updates["last_event"]
+                    self._attr_native_value = updates["last_event"]
+
+                # Update extended attributes (可选)
+                if "current_value" in updates:
+                    self._input_value = updates["current_value"]
+
+                if "sensitivity" in updates:
+                    self._sensitivity = updates["sensitivity"]
+
+                if "input_config" in updates:
+                    self._input_config = updates["input_config"]
+
+                if "input_mapping" in updates:
+                    self._input_mapping = updates["input_mapping"]
 
                 _LOGGER.debug(
                     "Interactive input updated from direct event: %s", updates
@@ -197,44 +256,46 @@ class ESPHomeInteractiveInput(SensorEntity):
 
     def _update_internal_state(self, state_data: dict) -> None:
         """Update internal entity state from state data."""
-        self._current_state.update(state_data)
-        self._attr_native_value = state_data.get("last_event", "none")
-        self._attr_extra_state_attributes = {
-            "input_type": state_data.get("input_type", "button"),
-            "last_event": state_data.get("last_event", "none"),
-            "current_value": state_data.get("current_value", 0.0),
-            "input_config": state_data.get("input_config", {}),
-            "input_mapping": state_data.get("input_mapping", {}),
-            "sensitivity": state_data.get("sensitivity", 50),
-            "node_id": self._node_id,
-            "device_name": self._device_name,
-            "last_update": state_data.get("last_update", time.time()),
-        }
+        # Update core attributes
+        if "input_type" in state_data:
+            self._input_type = state_data["input_type"]
+        if "last_event" in state_data:
+            self._input_events = state_data["last_event"]
+            self._attr_native_value = state_data["last_event"]
+
+        # Update extended attributes
+        if "current_value" in state_data:
+            self._input_value = state_data["current_value"]
+        if "sensitivity" in state_data:
+            self._sensitivity = state_data["sensitivity"]
+        if "input_config" in state_data:
+            self._input_config = state_data["input_config"]
+        if "input_mapping" in state_data:
+            self._input_mapping = state_data["input_mapping"]
+
+        self._last_update = state_data.get("last_update", time.time())
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra state attributes - only ESP32 reported parameters."""
-        input_type = self._current_state.get("input_type", "button")
-
-        # Show all ESP32 parameters exactly as reported
+        """Return extra state attributes."""
         attrs = {
-            # Core parameters from ESP32
-            "input_type": input_type,
-            "input_events": self._current_state.get("last_event", "none"),  # ESP32 param name
-            "input_value": self._current_state.get("current_value", 0.0),  # ESP32 param name
-            "last_event": self._current_state.get("last_event", "none"),
-            "sensitivity": self._current_state.get("sensitivity", 50),
+            "input_type": self._input_type,
+            "input_events": self._input_events,
         }
 
-        # Add config if it has meaningful content
-        input_config = self._current_state.get("input_config", {})
-        if input_config and input_config not in ({}, "{}"):
-            attrs["input_config"] = input_config
+        if hasattr(self, "_input_value"):
+            attrs["input_value"] = self._input_value
 
-        # Add mapping if it has meaningful content
-        input_mapping = self._current_state.get("input_mapping", {})
-        if input_mapping and input_mapping not in ({}, "{}"):
-            attrs["input_mapping"] = input_mapping
+        if hasattr(self, "_sensitivity"):
+            attrs["sensitivity"] = self._sensitivity
+
+        if hasattr(self, "_input_config"):
+            if self._input_config and self._input_config not in ({}, "{}"):
+                attrs["input_config"] = self._input_config
+
+        if hasattr(self, "_input_mapping"):
+            if self._input_mapping and self._input_mapping not in ({}, "{}"):
+                attrs["input_mapping"] = self._input_mapping
 
         return attrs
 
@@ -247,8 +308,8 @@ class ESPHomeInteractiveInput(SensorEntity):
         _LOGGER.info("Setting input type: %s -> %s", self._attr_name, input_type)
 
         # Update state
-        self._current_state["input_type"] = input_type
-        self._current_state["last_update"] = time.time()
+        self._input_type = input_type
+        self._last_update = time.time()
 
         # Send config to device through event bus
         self.hass.bus.async_fire(
@@ -267,8 +328,8 @@ class ESPHomeInteractiveInput(SensorEntity):
         _LOGGER.info("Setting sensitivity: %s -> %d", self._attr_name, sensitivity)
 
         # Update state
-        self._current_state["sensitivity"] = sensitivity
-        self._current_state["last_update"] = time.time()
+        self._sensitivity = sensitivity
+        self._last_update = time.time()
 
         # Send config to device through event bus
         self.hass.bus.async_fire(
@@ -281,8 +342,8 @@ class ESPHomeInteractiveInput(SensorEntity):
         _LOGGER.info("Setting input mapping: %s -> %s", self._attr_name, mapping)
 
         # Update state
-        self._current_state["input_mapping"] = mapping
-        self._current_state["last_update"] = time.time()
+        self._input_mapping = mapping
+        self._last_update = time.time()
 
         # Send config to device through event bus
         self.hass.bus.async_fire(
@@ -294,11 +355,11 @@ class ESPHomeInteractiveInput(SensorEntity):
         self, event_type: str, event_value: float | None = None
     ) -> None:
         """Manually trigger an input event (for testing)."""
-        input_type = self._current_state.get("input_type", "button")
-
-        if event_type not in INPUT_TYPE_EVENTS.get(input_type, []):
+        if event_type not in INPUT_TYPE_EVENTS.get(self._input_type, []):
             _LOGGER.error(
-                "Unsupported input event: %s (current type: %s)", event_type, input_type
+                "Unsupported input event: %s (current type: %s)",
+                event_type,
+                self._input_type,
             )
             return
 
@@ -310,13 +371,10 @@ class ESPHomeInteractiveInput(SensorEntity):
         )
 
         # Update state
-        self._current_state.update(
-            {
-                "last_event": event_type,
-                "current_value": event_value if event_value is not None else 0.0,
-                "last_update": time.time(),
-            }
-        )
+        self._input_events = event_type
+        if event_value is not None:
+            self._input_value = event_value
+        self._last_update = time.time()
 
         # Send event through event bus
         self.hass.bus.async_fire(

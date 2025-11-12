@@ -181,8 +181,16 @@ class ESPDeviceListener:
             change_type: Type of change ("added", "updated", or "removed").
         """
         try:
+            _LOGGER.info(
+                "📡 mDNS event received: type=%s, name=%s, change_type=%s",
+                type_,
+                name,
+                change_type,
+            )
+
             info = zeroconf.get_service_info(type_, name)
             if not info or not info.addresses:
+                _LOGGER.warning("⚠️ No service info or addresses for %s", name)
                 return
 
             _LOGGER.debug("Service %s: %s", change_type, name)
@@ -195,6 +203,13 @@ class ESPDeviceListener:
 
             ip = socket.inet_ntoa(info.addresses[0])
             port = info.port  # Extract port from zeroconf service info
+
+            _LOGGER.info(
+                "📝 Extracted device info: node_id=%s, ip=%s, port=%s",
+                node_id,
+                ip,
+                port,
+            )
 
             if change_type == "removed":
                 self._process_device_removal(node_id)
@@ -221,6 +236,15 @@ class ESPDeviceListener:
         if port is None:
             port = 8080  # Default port
 
+        _LOGGER.info(
+            "🔍 _process_device_discovery called: node_id=%s, ip=%s, port=%s, change_type=%s, api=%s",
+            node_id,
+            ip,
+            port,
+            change_type,
+            "present" if self.api is not None else "None",
+        )
+
         if self.api is None:
             # Config flow discovery - allow all devices to be discovered
             _LOGGER.debug(
@@ -241,21 +265,32 @@ class ESPDeviceListener:
                 entry.unique_id for entry in existing_entries if entry.unique_id
             }
 
+            _LOGGER.info(
+                "📋 Checking if node_id %s is in existing entries. Existing: %s",
+                node_id,
+                existing_node_ids,
+            )
+
             if node_id in existing_node_ids:
-                _LOGGER.debug(
-                    "Discovered device (service): Node ID=%s IP=%s Port=%s Change=%s",
+                _LOGGER.info(
+                    "✅ Discovered device (service) - WILL CALL update_device: Node ID=%s IP=%s Port=%s Change=%s",
                     node_id,
                     ip,
                     port,
                     change_type,
                 )
+                
+                # Global listener for initial discovery and IP address updates
+                # Individual reconnection attempts use dedicated ServiceBrowser
                 self.hass.loop.call_soon_threadsafe(
                     self.hass.async_create_task,
                     self.api.update_device(node_id, ip, port),
                 )
             else:
-                _LOGGER.debug(
-                    "Ignoring unconfigured device discovery: Node ID=%s", node_id
+                _LOGGER.warning(
+                    "❌ Ignoring unconfigured device discovery: Node ID=%s (not in %s)",
+                    node_id,
+                    existing_node_ids,
                 )
 
     def _process_device_removal(self, node_id: str) -> None:

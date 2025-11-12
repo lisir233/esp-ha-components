@@ -960,7 +960,9 @@ text-align:center;max-width:600px}img{width:400px;height:400px;margin:20px 0;obj
 # ============================================================================
 
 # Sensor history and statistics configuration
-DEFAULT_MAX_HISTORY_ITEMS: Final[int] = 30  # Maximum cached history entries (~10 minutes)
+DEFAULT_MAX_HISTORY_ITEMS: Final[int] = 30  # Default cached history entries (~10 minutes at 20s interval)
+MAX_HISTORY_LIMIT: Final[int] = 10000  # Absolute maximum to prevent memory issues (safety limit)
+MAX_LATEST_VALUES_DURATION: Final[int] = 3600  # Maximum 1 hour (3600 seconds) for latest values duration
 DEFAULT_HISTORY_MINUTES: Final[int] = 5  # Default history duration for queries
 DEFAULT_STATISTICS_MINUTES: Final[int] = 10  # Default statistics duration
 TREND_CHANGE_THRESHOLD: Final[float] = 0.1  # 10% change threshold for trend detection

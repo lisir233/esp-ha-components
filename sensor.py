@@ -38,6 +38,8 @@ from .esp_iot import (
     DEFAULT_HISTORY_MINUTES,
     DEFAULT_MAX_HISTORY_ITEMS,
     DEFAULT_STATISTICS_MINUTES,
+    MAX_HISTORY_LIMIT,
+    MAX_LATEST_VALUES_DURATION,
     SENSOR_DISPLAY_NAMES,
     SENSOR_THRESHOLD_CONFIGS,
     SENSOR_TYPE_TO_NUMBER_MAPPING,
@@ -118,7 +120,7 @@ async def async_setup_entry(
     def handle_battery_energy_discovered(event):
         """Handle battery energy discovery event from ESP32"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             if event_node_id != node_id.lower():
                 return
             
@@ -146,7 +148,7 @@ async def async_setup_entry(
     def handle_imu_gesture_discovered(event):
         """Handle IMU gesture discovery event from ESP32"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             if event_node_id != node_id.lower():
                 return
             
@@ -175,7 +177,7 @@ async def async_setup_entry(
     def handle_interactive_input_discovered(event):
         """Handle interactive input discovery event from ESP32"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             if event_node_id != node_id.lower():
                 return
             
@@ -203,7 +205,7 @@ async def async_setup_entry(
     def handle_low_power_sleep_discovered(event):
         """Handle low power sleep discovery event from ESP32"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             if event_node_id != node_id.lower():
                 return
             
@@ -245,7 +247,7 @@ async def async_setup_entry(
             event: Event containing threshold data from ESP32 device.
         """
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             threshold_data = event.data.get("threshold_data", {})
 
             # Key filter: only process devices managed by current config entry
@@ -323,7 +325,7 @@ async def async_setup_entry(
             _LOGGER.debug("Received sensor discovery event: %s", event.event_type)
             _LOGGER.debug("Event data: %s", event.data)
 
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
 
             # Key filter: only process devices managed by current config entry
             if event_node_id != node_id.lower():
@@ -504,7 +506,7 @@ async def async_setup_entry(
                         )
                     else:
                         _LOGGER.warning(
-                            "⚠️ No add_entities function found for device %s, config entry %s",
+                            "No add_entities function found for device %s, config entry %s",
                             node_id,
                             target_config_entry.entry_id[-8:],
                         )
@@ -577,7 +579,7 @@ async def async_setup_entry(
     async def handle_imu_gesture_update(event):
         """Handle IMU gesture data update events - optimized to prevent duplicate processing"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
             event_type = event.event_type
 
             # Key filter: only process devices managed by current config entry
@@ -651,7 +653,7 @@ async def async_setup_entry(
     async def handle_number_threshold_update(event):
         """Handle threshold update events from number platform and send to ESP32"""
         try:
-            event_node_id = event.data.get("node_id", "").lower()
+            event_node_id = event.data.get("node_id", "").replace(":", "").lower()
 
             # Key filter: only process devices managed by current config entry
             if event_node_id != node_id.lower():
@@ -1675,7 +1677,13 @@ class ESPHomeSensor(SensorEntity):
         self._unsub_update = None
         self._last_update_time = None
         self._value_history = []
+        # Internal: actual history buffer size (can be configured by ESP32)
         self._max_history_items = DEFAULT_MAX_HISTORY_ITEMS
+        
+        # Extended attributes: will be set if ESP32 provides them via get_property
+        # When _max_history_count is detected, it will update _max_history_items
+        # self._max_history_count = None  # ESP32 config: shown in UI, updates _max_history_items
+        # self._latest_values_duration = None  # ESP32 config: affects statistics window (e.g., 60 seconds)
 
     def _set_initial_value(
         self, is_discovery: bool, current_value: Any, param_info: dict
@@ -1773,14 +1781,17 @@ class ESPHomeSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, any]:
         """Return extra state attributes with useful statistics and historical data."""
         try:
-            recent_history = self.get_recent_history(5)  # Last 5 minutes
+            # Use configured duration or default to 5 minutes
+            stats_duration = getattr(self, "_latest_values_duration", 300) // 60  # Convert seconds to minutes
+            recent_history = self.get_recent_history(stats_duration)
             
-            # Show useful statistics from HA's local history tracking
+            # Core attributes (always present)
             attributes = {
-                "history_count": len(self._value_history),  # Total cache count (1-30)
-                "history_5m_count": len(recent_history),  # Last 5 minutes count
+                "history_count": len(self._value_history),
+                f"history_{stats_duration}m_count": len(recent_history),
             }
 
+            # Calculate statistics for recent history
             if recent_history:
                 values = [
                     float(item["value"])
@@ -1789,16 +1800,44 @@ class ESPHomeSensor(SensorEntity):
                 ]
 
                 if values:
+                    # Show all values in recent_history (up to stats_duration minutes)
+                    # This respects the configured latest_values_duration (default 5 minutes)
                     attributes.update(
                         {
-                            "min_5m": min(values),
-                            "max_5m": max(values),
-                            "avg_5m": round(sum(values) / len(values), 2),
-                            "latest_values": [
-                                item["value"] for item in recent_history[-3:]
-                            ],  # Last 3 values
+                            f"min_{stats_duration}m": min(values),
+                            f"max_{stats_duration}m": max(values),
+                            f"avg_{stats_duration}m": round(sum(values) / len(values), 2),
+                            "latest_values": [item["value"] for item in recent_history],  # 显示时间窗口内的所有值
                         }
                     )
+                else:
+                    # 即使没有数据，也显示空值，保持属性完整性
+                    attributes.update(
+                        {
+                            f"min_{stats_duration}m": None,
+                            f"max_{stats_duration}m": None,
+                            f"avg_{stats_duration}m": None,
+                            "latest_values": [],
+                        }
+                    )
+            else:
+                # 没有历史数据时，也显示空值
+                attributes.update(
+                    {
+                        f"min_{stats_duration}m": None,
+                        f"max_{stats_duration}m": None,
+                        f"avg_{stats_duration}m": None,
+                        "latest_values": [],
+                    }
+                )
+
+            # Extended attributes (only if configured by ESP32) - 扩展配置参数
+            # Show max_history_count only if different from default
+            if self._max_history_items != DEFAULT_MAX_HISTORY_ITEMS:
+                attributes["max_history_count"] = self._max_history_items
+            
+            if hasattr(self, "_latest_values_duration"):
+                attributes["latest_values_duration"] = f"{self._latest_values_duration}s"
 
             return attributes
         except Exception as err:
@@ -2043,7 +2082,20 @@ class ESPHomeSensor(SensorEntity):
             f"{DOMAIN}_sensor_update", self._handle_sensor_update
         )
 
+        # Listen for device availability changes
+        self._unsub_availability = self.hass.bus.async_listen(
+            f"{DOMAIN}_device_availability_changed", self._handle_device_availability_change
+        )
+
         _LOGGER.debug("Sensor entity added to HA: %s", self._attr_unique_id)
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self._hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
 
     def _update_value_from_device(self):
         """Update sensor value from device data"""
@@ -2092,7 +2144,34 @@ class ESPHomeSensor(SensorEntity):
         """Clean up resources"""
         if self._unsub_update:
             self._unsub_update()
-            _LOGGER.debug("Sensor entity removed from HA: %s", self._attr_unique_id)
+        if self._unsub_availability:
+            self._unsub_availability()
+        _LOGGER.debug("Sensor entity removed from HA: %s", self._attr_unique_id)
+
+    async def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change - update entity state."""
+        try:
+            # Normalize node_id to lowercase for comparison
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+            device_node_id = str(self._device_info["node_id"]).replace(":", "").lower()
+
+            # Only update if this event is for our device
+            if event_node_id == device_node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating sensor entity %s",
+                    device_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                # Trigger state update - the available property will return current state
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
 
     async def _handle_sensor_update(self, event) -> None:
         """Handle sensor update event"""
@@ -2109,6 +2188,54 @@ class ESPHomeSensor(SensorEntity):
             event_type = event.data.get("type") or event.data.get("sensor_type", "")
             if event_type != self._sensor_type:
                 return
+
+            # Detect and update extended configuration parameters from ESP32
+            params = event.data.get("params", {})
+
+            # Detect max_history_count configuration with safety limit
+            if "max_history_count" in params:
+                requested_max = int(params["max_history_count"])
+                # Enforce maximum limit for memory safety
+                new_max = min(requested_max, MAX_HISTORY_LIMIT)
+                if self._max_history_items != new_max:
+                    self._max_history_items = new_max
+                    if requested_max > MAX_HISTORY_LIMIT:
+                        _LOGGER.warning(
+                            "请求的历史记录数量 %d 超过最大限制 %d，已限制为 %d (传感器: %s)",
+                            requested_max,
+                            MAX_HISTORY_LIMIT,
+                            new_max,
+                            self._sensor_type,
+                        )
+                    else:
+                        _LOGGER.info(
+                            "检测到扩展配置 max_history_count: %d (传感器: %s)",
+                            new_max,
+                            self._sensor_type,
+                        )
+
+            # Detect latest_values_duration configuration with safety limit
+            if "latest_values_duration" in params:
+                requested_duration = int(params["latest_values_duration"])
+                # Enforce maximum limit of 1 hour (3600 seconds)
+                new_duration = min(requested_duration, MAX_LATEST_VALUES_DURATION)
+                old_duration = getattr(self, "_latest_values_duration", None)
+                if old_duration != new_duration:
+                    self._latest_values_duration = new_duration
+                    if requested_duration > MAX_LATEST_VALUES_DURATION:
+                        _LOGGER.warning(
+                            "请求的统计时长 %d 秒超过最大限制 %d 秒，已限制为 %d (传感器: %s)",
+                            requested_duration,
+                            MAX_LATEST_VALUES_DURATION,
+                            new_duration,
+                            self._sensor_type,
+                        )
+                    else:
+                        _LOGGER.info(
+                            "检测到扩展配置 latest_values_duration: %d 秒 (传感器: %s)",
+                            new_duration,
+                            self._sensor_type,
+                        )
 
             # Update sensor value
             new_value_data = event.data.get("value") or event.data.get("current_value")
@@ -2207,8 +2334,8 @@ class ESPHomeSensor(SensorEntity):
                         err,
                     )
 
-        except Exception:
-            _LOGGER.error("Error in async_write_ha_state for %s: %s", self.entity_id, e)
+        except Exception as err:
+            _LOGGER.error("Error in async_write_ha_state for %s: %s", self.entity_id, err)
             # Still call parent method even if threshold checking fails
             try:
                 super().async_write_ha_state()

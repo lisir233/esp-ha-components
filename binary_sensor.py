@@ -40,12 +40,16 @@ async def async_setup_entry(
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
 
+    # Track discovered binary sensors to prevent duplicates
+    discovered_key = f"discovered_binary_sensors_{node_id}"
+    if discovered_key not in hass.data[DOMAIN]:
+        hass.data[DOMAIN][discovered_key] = set()
+
     # Store reference for discovery event handler
     entry_key = f"{node_id}_{config_entry.entry_id}"
     hass.data[DOMAIN][f"add_binary_entities_{entry_key}"] = async_add_entities
 
     # Event handler for binary sensor discovery
-    @callback
     async def handle_binary_sensor_discovered(event) -> None:
         """Handle binary sensor discovery events."""
         try:
@@ -54,6 +58,24 @@ async def async_setup_entry(
             # Only process events for this device
             if event_node_id != node_id.lower():
                 return
+
+            # Check if binary sensor already discovered to prevent duplicates
+            discovered_key = f"discovered_binary_sensors_{node_id}"
+            discovered_sensors = hass.data[DOMAIN].get(discovered_key, set())
+            
+            # Use unique key to track this binary sensor (one per device)
+            sensor_key = f"{event_node_id}_binary_sensor"
+            
+            if sensor_key in discovered_sensors:
+                _LOGGER.debug(
+                    "Binary sensor already exists for device %s, skipping duplicate creation",
+                    event_node_id,
+                )
+                return
+            
+            # Mark as discovered
+            discovered_sensors.add(sensor_key)
+            hass.data[DOMAIN][discovered_key] = discovered_sensors
 
             device_info_data = event.data.get("device_info", {})
             if not device_info_data or "node_id" not in device_info_data:
@@ -82,7 +104,7 @@ async def async_setup_entry(
             )
 
             async_add_entities([binary_sensor])
-            _LOGGER.debug("Added binary sensor: %s", sensor_name)
+            _LOGGER.debug("Added binary sensor: %s (ID: %s)", sensor_name, sensor_key)
 
         except Exception:
             _LOGGER.exception("Failed to process binary sensor discovery")
@@ -110,12 +132,11 @@ class ESPHomeBinarySensor(BinarySensorEntity):
         self.hass = hass
         self._params = sensor_params or {}
 
-        # Generate unique ID (use generic binary_sensor, not specific sensor type)
+        # Generate unique ID (one binary sensor per device)
         device_node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
         self._attr_unique_id = f"{DOMAIN}_{device_node_id}_binary_sensor"
 
         # Entity attributes
-        self._attr_has_entity_name = True
         self._attr_name = "Binary Sensor"
         self._attr_is_on = self._params.get("state", False)
 
@@ -136,12 +157,12 @@ class ESPHomeBinarySensor(BinarySensorEntity):
             device_info["node_id"], device_info["name"]
         )
 
-        # Extra attributes - use normalized device class for consistency
-        self._attr_extra_state_attributes = {
-            "device_class": device_class_normalized,  # Use normalized value
-            "debounce_time": None,
-            "report_interval": None,
-        }
+        # Core attributes
+        self._binary_sensor_type = device_class_normalized
+        self._attr_extra_state_attributes = {}
+
+        # Store node_id for availability check
+        self._node_id = device_node_id
 
         _LOGGER.debug(
             "Initialized binary sensor: %s (ID: %s, Type: %s)",
@@ -162,27 +183,65 @@ class ESPHomeBinarySensor(BinarySensorEntity):
             )
         )
 
+        # Subscribe to device availability changes (offline/online)
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                f"{DOMAIN}_device_availability_changed",
+                self._handle_device_availability_change,
+            )
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self.hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
+
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the state attributes - dynamically generated to always show current values."""
-        # Always return current state and all configuration parameters
+        """Return the state attributes."""
         attrs = {
-            "state": "ON" if self._attr_is_on else "OFF",  # Current state as text
-            "state_bool": self._attr_is_on,  # Boolean value
-            "device_class": self._attr_extra_state_attributes.get("device_class", "generic"),
+            "binary_sensor_type": self._binary_sensor_type,
         }
-        
-        # Add configuration parameters if available
-        if self._attr_extra_state_attributes.get("debounce_time") is not None:
+        if "debounce_time" in self._attr_extra_state_attributes:
             attrs["debounce_time"] = self._attr_extra_state_attributes["debounce_time"]
-        
-        if self._attr_extra_state_attributes.get("report_interval") is not None:
+
+        if "report_interval" in self._attr_extra_state_attributes:
             attrs["report_interval"] = self._attr_extra_state_attributes["report_interval"]
-        
+
         return attrs
 
+    async def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change - update entity state."""
+        try:
+            # Normalize node_id from event
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+
+            # Extract node_id from device_info
+            device_node_id = extract_node_id_from_device_info(self._attr_device_info)
+
+            # Only update if this event is for our device
+            if event_node_id == device_node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating binary sensor %s",
+                    device_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                # Trigger state update - the available property will return current state
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
+
     @callback
-    async def _handle_state_update(self, event) -> None:
+    def _handle_state_update(self, event) -> None:
         """Handle state update events."""
         try:
             state_data = event.data if hasattr(event, "data") else event
@@ -200,17 +259,23 @@ class ESPHomeBinarySensor(BinarySensorEntity):
             # Note: We don't filter by sensor_name because there's only one binary_sensor per device
             # The binary_sensor entity displays different states (door, motion, etc.) via device_class
 
+            # Track what changed for debug logging
+            state_changed = False
+            device_class_updated = False
+            config_updated = False
+            
             # Update state from sensor_value
             new_state = state_data.get("sensor_value")
             if new_state is not None:
+                old_state = self._attr_is_on
                 new_state = bool(new_state)
-                if new_state != self._attr_is_on:
-                    self._attr_is_on = new_state
-                    # State will be shown via extra_state_attributes property
-                    self.async_write_ha_state()
+                self._attr_is_on = new_state
+                state_changed = (old_state != new_state)
+                if state_changed:
                     _LOGGER.debug(
-                        "Updated binary sensor %s: %s",
+                        "Updated binary sensor %s: %s -> %s",
                         self._attr_name,
+                        "ON" if old_state else "OFF",
                         "ON" if new_state else "OFF",
                     )
 
@@ -225,51 +290,86 @@ class ESPHomeBinarySensor(BinarySensorEntity):
                 device_class_normalized = get_binary_sensor_device_class(
                     str(device_class), DEFAULT_BINARY_SENSOR_DEVICE_CLASS
                 )
-                # Convert string to enum
-                new_device_class = getattr(
-                    BinarySensorDeviceClass, device_class_normalized.upper()
-                )
 
-                # Only update if device class actually changed
-                if new_device_class != self._attr_device_class:
+                # Update binary_sensor_type and device_class if changed
+                if self._binary_sensor_type != device_class_normalized:
+                    old_type = self._binary_sensor_type
+                    self._binary_sensor_type = device_class_normalized
+
+                    # Also update _attr_device_class to change the icon
+                    new_device_class = getattr(
+                        BinarySensorDeviceClass, device_class_normalized.upper()
+                    )
                     self._attr_device_class = new_device_class
-                    # Also update extra_state_attributes to show the device class
-                    self._attr_extra_state_attributes["device_class"] = device_class_normalized
-                    self.async_write_ha_state()
-                    _LOGGER.debug(
-                        "Updated device class for %s: %s",
+
+                    device_class_updated = True
+                    _LOGGER.info(
+                        "Binary sensor %s type changed: %s -> %s (icon will update to match)",
                         self._attr_name,
+                        old_type,
                         device_class_normalized,
                     )
-                # Even if device class didn't change, ensure it's in attributes
-                elif "device_class" not in self._attr_extra_state_attributes:
-                    self._attr_extra_state_attributes["device_class"] = device_class_normalized
 
-            # Update configuration parameters if provided
-            config_updated = False
+            # Update extended attributes only if ESP32 provides them
+            # These are optional and detected dynamically from params
             debounce_time = params.get("debounce_time")
             if debounce_time is not None:
-                self._attr_extra_state_attributes["debounce_time"] = f"{debounce_time}ms"
-                config_updated = True
-                _LOGGER.debug(
-                    "Updated debounce_time for %s: %dms",
-                    self._attr_name,
-                    debounce_time,
-                )
+                new_debounce = f"{debounce_time}ms"
+                current_debounce = self._attr_extra_state_attributes.get("debounce_time")
+                if current_debounce != new_debounce:
+                    self._attr_extra_state_attributes["debounce_time"] = new_debounce
+                    config_updated = True
+                    if current_debounce is None:
+                        _LOGGER.info(
+                            "Detected extended attribute debounce_time for %s: %s",
+                            self._attr_name,
+                            new_debounce,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Updated debounce_time for %s: %s -> %s",
+                            self._attr_name,
+                            current_debounce,
+                            new_debounce,
+                        )
 
             report_interval = params.get("report_interval")
             if report_interval is not None:
-                self._attr_extra_state_attributes["report_interval"] = f"{report_interval}ms"
-                config_updated = True
-                _LOGGER.debug(
-                    "Updated report_interval for %s: %dms",
-                    self._attr_name,
-                    report_interval,
-                )
+                new_interval = f"{report_interval}ms"
+                current_interval = self._attr_extra_state_attributes.get("report_interval")
+                if current_interval != new_interval:
+                    self._attr_extra_state_attributes["report_interval"] = new_interval
+                    config_updated = True
+                    if current_interval is None:
+                        _LOGGER.info(
+                            "Detected extended attribute report_interval for %s: %s",
+                            self._attr_name,
+                            new_interval,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Updated report_interval for %s: %s -> %s",
+                            self._attr_name,
+                            current_interval,
+                            new_interval,
+                        )
 
-            # Write state if config was updated
-            if config_updated:
+            # Only update HA state if something actually changed
+            # This prevents unnecessary UI refreshes that cause page jumping
+            if state_changed or device_class_updated or config_updated:
                 self.async_write_ha_state()
+                _LOGGER.debug(
+                    "Binary sensor %s state written to HA: state_changed=%s, device_class_updated=%s, config_updated=%s",
+                    self._attr_name,
+                    state_changed,
+                    device_class_updated,
+                    config_updated,
+                )
+            else:
+                _LOGGER.debug(
+                    "Binary sensor %s: no changes detected, skipping state update to prevent UI refresh",
+                    self._attr_name,
+                )
 
         except Exception:
             _LOGGER.exception("Failed to process binary sensor update")

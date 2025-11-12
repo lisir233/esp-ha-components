@@ -70,7 +70,23 @@ class ESPHomeBatteryEnergy(SensorEntity):
             )
         )
 
+        # Subscribe to device availability changes
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                f"{DOMAIN}_device_availability_changed",
+                self._handle_device_availability_change,
+            )
+        )
+
         _LOGGER.debug("Battery entity added to Home Assistant: %s", self._attr_name)
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available (device is connected)."""
+        api = self.hass.data.get(DOMAIN, {}).get("shared_api")
+        if api:
+            return api.is_device_available(self._node_id)
+        return False
 
     @property
     def icon(self) -> str:
@@ -90,6 +106,28 @@ class ESPHomeBatteryEnergy(SensorEntity):
             "charging_status": BATTERY_STATES.get(self._charging_status, "Unknown"),
             "alert_level": BATTERY_ALERT_LEVELS.get(self._alert_level, "Unknown"),
         }
+
+    @callback
+    def _handle_device_availability_change(self, event) -> None:
+        """Handle device availability change - update entity state."""
+        try:
+            event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
+
+            if event_node_id == self._node_id:
+                available = event.data.get("available", False)
+                _LOGGER.debug(
+                    "Device %s availability changed to %s, updating battery entity %s",
+                    event_node_id,
+                    "available" if available else "unavailable",
+                    self._attr_unique_id,
+                )
+                self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.error(
+                "Error handling device availability change for %s: %s",
+                self._attr_unique_id,
+                err,
+            )
 
     @callback
     def _handle_battery_energy_update(self, event) -> None:

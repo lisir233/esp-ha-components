@@ -108,11 +108,12 @@ class Security1(Security):
             self._print_verbose(
                 f"Updated Shared Key (Shared key XORed with PoP):\t0x{sharedK.hex()}"
             )
-        # Initialize the encryption engine with Shared Key and initialization vector
-        cipher = Cipher(
-            algorithms.AES(sharedK), modes.CTR(device_random), backend=default_backend()
-        )
-        self.cipher = cipher.encryptor()
+        # Initialize separate encryption and decryption engines with same Shared Key and initialization vector
+        # Both start with the same initial offset, but maintain independent counters
+        cipher_encrypt = Cipher(algorithms.AES(sharedK), modes.CTR(device_random), backend=default_backend())
+        cipher_decrypt = Cipher(algorithms.AES(sharedK), modes.CTR(device_random), backend=default_backend())
+        self.cipher_encrypt = cipher_encrypt.encryptor()
+        self.cipher_decrypt = cipher_decrypt.decryptor()
 
     def setup1_request(self):
         # Form SessionCmd1 request packet using encrypted device public key
@@ -120,7 +121,7 @@ class Security1(Security):
         setup_req.sec_ver = proto.session_pb2.SecScheme1
         setup_req.sec1.msg = proto.sec1_pb2.Session_Command1
         # Encrypt device public key and attach to the request packet
-        client_verify = self.cipher.update(self.device_public_key)
+        client_verify = self.cipher_encrypt.update(self.device_public_key)
         self._print_verbose(f"Client Proof:\t0x{client_verify.hex()}")
         setup_req.sec1.sc1.client_verify_data = client_verify
         return setup_req.SerializeToString().decode("latin-1")
@@ -134,10 +135,12 @@ class Security1(Security):
             # Read encrypyed device verify string
             device_verify = setup_resp.sec1.sr1.device_verify_data
             self._print_verbose(f"Device Proof:\t0x{device_verify.hex()}")
-            # Decrypt the device verify string
-            enc_client_pubkey = self.cipher.update(
-                setup_resp.sec1.sr1.device_verify_data
-            )
+            # Synchronize decrypt offset to match where device encrypt started
+            # Device decrypted our data (0→32), then synchronized its encrypt offset,
+            # so we need to synchronize our decrypt offset before decrypting device's response
+            self.cipher_decrypt.update(bytes(len(self.device_public_key)))
+            enc_client_pubkey = self.cipher_decrypt.update(setup_resp.sec1.sr1.device_verify_data)
+
             # Match decryped string with client public key
             if enc_client_pubkey != self.client_public_key:
                 raise RuntimeError("Failed to verify device!")
@@ -145,7 +148,7 @@ class Security1(Security):
             raise RuntimeError("Unsupported security protocol")
 
     def encrypt_data(self, data):
-        return self.cipher.update(data)
+        return self.cipher_encrypt.update(data)
 
     def decrypt_data(self, data):
-        return self.cipher.update(data)
+        return self.cipher_decrypt.update(data)

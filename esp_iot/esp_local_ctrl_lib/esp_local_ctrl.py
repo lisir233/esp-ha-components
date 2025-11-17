@@ -7,9 +7,6 @@ import argparse
 import asyncio
 from getpass import getpass
 import json
-import os
-from pathlib import Path
-import ssl
 import struct
 import sys
 import textwrap
@@ -32,9 +29,6 @@ PROP_TYPE_STRING = 3
 
 # Property flags enum
 PROP_FLAG_READONLY = 1 << 0
-
-
-# ===== NEW: HTTP MESSAGE TYPE CONSTANTS =====
 
 
 class MessageSource:
@@ -75,55 +69,15 @@ def encode_prop_value(prop, value):
 
 def decode_prop_value(prop, value):
     try:
-        # Extract property name for system property detection
         prop_name = prop.get("name", "").lower()
 
-        # ===== CRITICAL: System Properties Special Handling =====
-        # WHY THIS IS NECESSARY:
-        #
-        # ESP32 reports two system properties that have type mismatches:
-        #   1. Property 'config' with type=1 (PROP_TYPE_NODE_CONFIG)
-        #      - ESP32 declares type=1 (which means INT32 in Python: 4 bytes)
-        #      - But actually sends: JSON string (~11317 bytes)
-        #      - Python receives: {'name': 'config', 'type': 1, 'value': b'{...11317...}'}
-        #      - Problem: struct.unpack('i', b'{...11317...}') FAILS!
-        #                 Error: "unpack requires a buffer of 4 bytes"
-        #
-        #   2. Property 'params' with type=2 (PROP_TYPE_NODE_PARAMS)
-        #      - ESP32 declares type=2 (which means BOOLEAN in Python: 1 byte)
-        #      - But actually sends: JSON string (~1700 bytes)
-        #      - Python receives: {'name': 'params', 'type': 2, 'value': b'{...1700...}'}
-        #      - Problem: struct.unpack('?', b'{...1700...}') FAILS!
-        #                 Error: "unpack requires a buffer of 1 byte"
-        #
-        # SOLUTION:
-        # These system properties are ALWAYS JSON strings in ESP RainMaker framework.
-        # We check the property NAME first (before type code) and decode directly.
-        # This bypasses the type mismatch problem entirely.
-        #
-        # Root Cause of Type Collision:
-        #   ESP32 side (esp_rmaker_local_ctrl.c):
-        #     enum property_types {
-        #         PROP_TYPE_NODE_CONFIG = 1,    // ← Collides with PROP_TYPE_INT32
-        #         PROP_TYPE_NODE_PARAMS = 2,    // ← Collides with PROP_TYPE_BOOLEAN
-        #     }
-        #
-        #   Python side (esp_local_ctrl.py):
-        #     PROP_TYPE_TIMESTAMP = 0
-        #     PROP_TYPE_INT32 = 1           // ← Collision here!
-        #     PROP_TYPE_BOOLEAN = 2         // ← Collision here!
-        #     PROP_TYPE_STRING = 3
-        #
-        # The type codes happen to match standard data types, but the data doesn't!
-        # By checking property NAME instead of type code, we avoid the mismatch.
-        #
+        # Handle system properties with type collision
+        # ESP32 declares 'config' as type=1 and 'params' as type=2
+        # but sends JSON strings instead of INT32/BOOLEAN
         if prop_name in ("config", "params"):
-            # System properties are always JSON strings
-            # Use latin-1 decoding directly instead of struct.unpack()
             return value.decode("latin-1")
 
-        # ===== Standard Type-Based Parsing =====
-        # For all other properties, use the type code to determine how to decode
+        # Standard type-based parsing
         if prop["type"] == PROP_TYPE_TIMESTAMP:
             return struct.unpack("q", value)[0]
         if prop["type"] == PROP_TYPE_INT32:
@@ -172,10 +126,7 @@ def get_security(secver, sec_patch_ver, username, password, pop="", verbose=Fals
     return None
 
 
-# ===== NEW: HTTP HEADER PARSING =====
-
-
-def parse_http_headers(raw_data):
+def parse_http_headers(raw_data, offset=0):
     """Parse HTTP headers in EVENT/1.0 format.
 
     Extracts HTTP headers, payload, and determines message type by analyzing:
@@ -188,90 +139,76 @@ def parse_http_headers(raw_data):
 
     Args:
         raw_data: Raw bytes from socket containing HTTP headers and payload
+        offset: Number of bytes already skipped from the original buffer (for recursion)
 
     Returns:
-        Tuple of (status_line, headers_dict, payload_bytes, message_source)
-        or (None, None, None, None) if headers are incomplete or invalid
+        Tuple of (status_line, headers_dict, payload_bytes, message_source, headers_end_offset)
+        - headers_end_offset: Position in ORIGINAL buffer where headers end (including \r\n\r\n)
+        or (None, None, None, None, 0) if headers are incomplete or invalid
 
     Example:
-        >>> status, headers, payload, source = parse_http_headers(raw_data)
+        >>> status, headers, payload, source, offset = parse_http_headers(raw_data)
         >>> if status:
         ...     print(f"Content-Length: {headers.get('Content-Length')}")
         ...     print(f"Message source: {source}")
+        ...     print(f"Headers end at offset: {offset}")
     """
     try:
-        # Find the double CRLF that separates headers from payload
+        # Validate buffer starts with valid HTTP status line
+        if len(raw_data) < 20:
+            return (None, None, None, None, 0)
+        
+        # Check if buffer starts with valid HTTP status line
+        try:
+            prefix = raw_data[:20].decode('ascii', errors='ignore')
+        except:
+            prefix = ""
+        
+        # If buffer doesn't start with valid headers, search for next valid header position
+        if not prefix.startswith(("HTTP/", "EVENT/")):
+            for pattern in [b"EVENT/", b"HTTP/"]:
+                next_header_pos = raw_data.find(pattern)
+                if next_header_pos > 0:
+                    return parse_http_headers(raw_data[next_header_pos:], offset + next_header_pos)
+            return (None, None, None, None, 0)
+        
+        # Find header/body separator
         separator = b"\r\n\r\n"
         sep_index = raw_data.find(separator)
 
         if sep_index == -1:
-            # Headers not complete yet
-            return (None, None, None, None)
+            return (None, None, None, None, 0)
 
         # Extract headers and payload
         headers_raw = raw_data[:sep_index].decode("latin-1")
         payload = raw_data[sep_index + 4 :]
 
-        # ✅ DEBUG: Log raw headers
-        print(
-            f"[DEBUG] parse_http_headers: Raw headers (first 200 chars):\n{headers_raw[:200]}"
-        )
-
         # Parse status line and headers
         lines = headers_raw.split("\r\n")
-        status_line = lines[0]  # "EVENT/1.0 200 OK" or "HTTP/1.1 200 OK"
-
-        print(f"[DEBUG] parse_http_headers: Status line: {status_line}")
+        status_line = lines[0]
 
         headers = {}
         for line in lines[1:]:
             if ":" in line:
                 key, value = line.split(":", 1)
                 headers[key.strip()] = value.strip()
-                print(
-                    f"[DEBUG] parse_http_headers: Header: {key.strip()}={value.strip()}"
-                )
 
         # Determine message source from HTTP headers
-        # Check both status line and Content-Type header
         message_source = MessageSource.UNKNOWN
-
-        # Extract Content-Type
         content_type = headers.get("Content-Type", "").lower()
 
-        print(f"[DEBUG] parse_http_headers: Content-Type: {content_type}")
-        print(
-            f"[DEBUG] parse_http_headers: Checking: 'EVENT/1.0' in status_line? {'EVENT/1.0' in status_line}"
-        )
-        print(
-            f"[DEBUG] parse_http_headers: Checking: 'application/hap+json' in content_type? {'application/hap+json' in content_type}"
-        )
-        print(
-            f"[DEBUG] parse_http_headers: Checking: 'HTTP/1.1' in status_line? {'HTTP/1.1' in status_line}"
-        )
-        print(
-            f"[DEBUG] parse_http_headers: Checking: 'text/html' in content_type? {'text/html' in content_type}"
-        )
-
-        # Active Report: EVENT/1.0 status line + application/hap+json Content-Type
         if "EVENT/1.0" in status_line and "application/hap+json" in content_type:
             message_source = MessageSource.ACTIVE_REPORT
-            print("[DEBUG] parse_http_headers: ✅ Identified as ACTIVE_REPORT")
-
-        # Query/Control Response: HTTP/1.1 status line + text/html Content-Type
         elif "HTTP/1.1" in status_line and "text/html" in content_type:
             message_source = MessageSource.QUERY_RESPONSE
-            print("[DEBUG] parse_http_headers: ✅ Identified as QUERY_RESPONSE")
-        else:
-            print(
-                f"[DEBUG] parse_http_headers: ⚠️  UNKNOWN message type - Status: {status_line}, Content-Type: {content_type}"
-            )
 
-        return (status_line, headers, payload, message_source)
+        # Calculate the absolute position where headers end in the original buffer
+        headers_end_offset = offset + sep_index + 4
+        return (status_line, headers, payload, message_source, headers_end_offset)
 
     except Exception as err:
         print(f"Error parsing HTTP headers: {err}")
-        return (None, None, None, None)
+        return (None, None, None, None, 0)
 
 
 def get_content_length(headers):
@@ -290,9 +227,6 @@ def get_content_length(headers):
         return 0
 
 
-# ===== NEW: MESSAGE TYPE DETECTION AND DECODING =====
-
-
 async def handle_incoming_http_message(raw_message_data, security_ctx, verbose=False):
     """Handle incoming HTTP message from ESP32 device.
 
@@ -309,61 +243,55 @@ async def handle_incoming_http_message(raw_message_data, security_ctx, verbose=F
         verbose: Enable verbose logging
 
     Returns:
-        Tuple of (message_source, parsed_data) or (None, None) on error
+        Tuple of (message_source, parsed_data, message_size) or (None, None, 0) on error
         where message_source is:
             - MessageSource.ACTIVE_REPORT (unsolicited device update from ESP32)
             - MessageSource.QUERY_RESPONSE (response to our query/control request)
             - 'set_response' (response to SET command)
             - 'count_response' (response to COUNT command)
+        and message_size is the total bytes consumed (headers + payload)
 
     Example:
-        >>> msg_source, data = await handle_incoming_http_message(raw_bytes, sec_ctx)
+        >>> msg_source, data, msg_size = await handle_incoming_http_message(raw_bytes, sec_ctx)
         >>> if msg_source == MessageSource.ACTIVE_REPORT:
         ...     properties = data.get('properties', [])
         ...     for prop in properties:
         ...         print(f"Property update: {prop}")
     """
     try:
-        # Parse HTTP headers (determines message type from headers)
-        status_line, headers, payload, message_source = parse_http_headers(
+        # Parse HTTP headers and determine message type
+        status_line, headers, payload, message_source, headers_end_offset = parse_http_headers(
             raw_message_data
         )
 
         if not status_line:
-            if verbose:
-                print("Incomplete HTTP headers, waiting for more data...")
-            return (None, None)
+            return (None, None, 0)
 
         if verbose:
             print(f"HTTP Status: {status_line}")
-            print(f"Message Source (from headers): {message_source}")
+            print(f"Message Source: {message_source}")
             print(f"Content-Length: {get_content_length(headers)}")
 
-        # Extract payload based on content-length
         content_length = get_content_length(headers)
+        
         if len(payload) < content_length:
-            if verbose:
-                print(f"Incomplete payload: {len(payload)}/{content_length} bytes")
-            return (None, None)
+            return (None, None, 0)
 
-        # Take only the required bytes
+        # Extract exact Content-Length bytes
         actual_payload = payload[:content_length]
+        message_size = headers_end_offset + content_length
 
-        if verbose:
-            print(f"Payload size: {len(actual_payload)} bytes")
-
-        # Decrypt and parse protobuf using unified parser
-        msg_type_str = message_source
-        parsed_data = proto_lc.parse_payload(msg_type_str, security_ctx, actual_payload)
+        # Decrypt and parse protobuf
+        parsed_data = proto_lc.parse_payload(message_source, security_ctx, actual_payload)
 
         if verbose:
             print(f"Parsed Data: {parsed_data}")
 
-        return (message_source, parsed_data)
+        return (message_source, parsed_data, message_size)
 
     except Exception as e:
         print(f"Error handling incoming HTTP message: {e}")
-        return (None, None)
+        return (None, None, 0)
 
 
 async def get_transport(sel_transport, service_name, check_hostname):
@@ -528,9 +456,6 @@ async def get_all_property_values(tp, security_ctx):
         return []
 
 
-# ===== NEW: HTTP MESSAGE LISTENING LOOP =====
-
-
 class HTTPMessageListener:
     """Listener for continuous HTTP messages from ESP32 device.
 
@@ -555,10 +480,10 @@ class HTTPMessageListener:
         self._running = False
         self._listen_task = None
         self._buffer = bytearray()
-        self._buffer_lock = asyncio.Lock()  # ✅ Add lock for buffer access
+        self._buffer_lock = asyncio.Lock()
 
         # Query response waiting mechanism
-        self._query_futures: dict[str, asyncio.Future] = {}  # query_id -> Future
+        self._query_futures: dict[str, asyncio.Future] = {}
         self._query_counter = 0
         self._query_lock = asyncio.Lock()
 
@@ -593,44 +518,18 @@ class HTTPMessageListener:
         # Create a future to hold the response
         response_future: asyncio.Future = asyncio.Future()
         self._query_futures[query_id] = response_future
-        print(f"[DEBUG] send_query_and_wait: Created future for {query_id}")
 
         try:
-            # Send query through transport
-            # The response will come through the listener's _listen_loop()
-            # and _process_buffer() will route it to this future
-            print(f"[DEBUG] send_query_and_wait: Sending query {query_id}")
             await transport.send_data("esp_local_ctrl/control", query_request)
-            print("[DEBUG] send_query_and_wait: Query sent, waiting for response...")
-
-            # Wait for response via the listener (support timeout)
-            # The response will be set by _process_buffer() when it arrives
             msg_source, data = await asyncio.wait_for(response_future, timeout=timeout)
-            print(
-                f"[DEBUG] send_query_and_wait: Received response for {query_id}: {msg_source}"
-            )
             return (msg_source, data)
 
         except TimeoutError:
-            print(
-                f"[DEBUG] send_query_and_wait: Query {query_id} timed out after {timeout} seconds"
-            )
-            print(
-                f"[DEBUG] send_query_and_wait: Waiting queries: {len(self._query_futures)}"
-            )
             return (None, None)
-        except Exception as e:
-            print(
-                f"[DEBUG] send_query_and_wait: Error waiting for query {query_id}: {e}"
-            )
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
             return (None, None)
         finally:
-            # Clean up
             self._query_futures.pop(query_id, None)
-            print(f"[DEBUG] send_query_and_wait: Cleaned up {query_id}")
 
     async def start(self):
         """Start listening for incoming messages."""
@@ -665,67 +564,43 @@ class HTTPMessageListener:
                     print("No socket available, stopping listener")
                     break
 
-                # Receive data with timeout
-                # ⚠️ IMPORTANT: Timeout handling strategy
-                # - TCP keepalive works at kernel level (invisible to recv())
-                # - recv() only returns APPLICATION data, NOT keepalive ACKs
-                # - If ESP32 doesn't send data for 60s, recv() timeout is NORMAL
-                # - Only socket errors (RST, connection closed) indicate real problems
-                #
-                # Timeout Strategy:
-                # - Use 60s timeout (long enough for normal idle periods)
-                # - Timeout is NORMAL - just continue waiting
-                # - Only mark error for SOCKET EXCEPTIONS (RST, closed, etc.)
+                # Receive data with timeout (60s)
+                # Timeout is normal during idle periods - TCP keepalive maintains connection at kernel level
                 try:
                     data = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(None, sock.recv, 4096),
                         timeout=60.0,
                     )
                 except asyncio.TimeoutError:
-                    # ✅ Timeout is NORMAL when ESP32 is idle (no active reports)
-                    # TCP keepalive maintains connection in background (invisible to recv)
-                    # Do NOT mark as error - just continue waiting
+                    # Timeout is normal when ESP32 is idle (no active reports)
+                    # TCP keepalive maintains connection in background
                     continue
                 except (ConnectionResetError, ConnectionRefusedError, BrokenPipeError, OSError) as e:
-                    # ✅ CRITICAL: Real socket errors (RST, connection closed, etc.)
-                    # These indicate the connection is actually broken
+                    # Real socket errors - connection is broken
                     if self.client and hasattr(self.client, 'mark_connection_error'):
                         self.client.mark_connection_error()
-                    # Cancel all waiting queries immediately
                     await self._cancel_all_queries()
-                    break  # Stop listener immediately on socket error
+                    break
                 except Exception as e:
-                    # ⚠️ Unexpected errors - log but don't mark connection as failed
-                    # This could be asyncio cancellation or other issues
+                    # Unexpected errors - log but don't mark connection as failed
                     await asyncio.sleep(1.0)
                     continue
 
                 if not data:
-                    print("[DEBUG] Listener: Socket closed by remote peer")
-                    # ✅ CRITICAL: Notify client of connection closure
-                    # Only mark if not already marked (avoid duplicate warnings)
+                    # Notify client of connection closure
                     if self.client and hasattr(self.client, 'mark_connection_error'):
                         if not getattr(self.client, '_connection_error', False):
                             self.client.mark_connection_error()
                     break
 
-                print(f"[DEBUG] Listener: Received {len(data)} bytes from socket")
-                print(f"[DEBUG] Listener: Data (hex): {data.hex()}")
-                print(f"[DEBUG] Listener: Data (ascii): {data}")
-
-                # Add to buffer
                 async with self._buffer_lock:
                     self._buffer.extend(data)
-                print(f"[DEBUG] Listener: Buffer size now: {len(self._buffer)} bytes")
 
-                # Process complete messages from buffer
                 await self._process_buffer()
 
             except asyncio.CancelledError:
-                print("[DEBUG] Listener: Cancelled")
                 break
-            except Exception as e:
-                print(f"[DEBUG] Listener: Error in listen loop: {e}")
+            except Exception:
                 await asyncio.sleep(1.0)
 
     async def _process_buffer(self):
@@ -735,153 +610,64 @@ class HTTPMessageListener:
         Continue until buffer is empty or incomplete message is encountered.
         """
         error_count = 0
-        max_consecutive_errors = 10  # Safety: stop if too many errors in a row
-
+        max_consecutive_errors = 10
+        
         while len(self._buffer) > 0 and error_count < max_consecutive_errors:
             try:
-                print(
-                    f"[DEBUG] _process_buffer: Processing buffer, size: {len(self._buffer)}"
-                )
-                # Try to parse complete HTTP message
-                msg_source, data = await handle_incoming_http_message(
+                msg_source, data, message_size = await handle_incoming_http_message(
                     bytes(self._buffer), self.security_ctx, verbose=False
                 )
 
-                print(
-                    f"[DEBUG] _process_buffer: Parsed message, msg_source={msg_source}, data_type={type(data)}"
-                )
-
-                # If message incomplete, wait for more data
                 if msg_source is None:
-                    print(
-                        "[DEBUG] _process_buffer: Message incomplete, waiting for more data"
-                    )
-                    # Special case: SET responses from device may be headerless (just \r\n + 4 bytes encrypted)
+                    if message_size > 0:
+                        async with self._buffer_lock:
+                            self._buffer = bytearray(self._buffer[message_size:])
+                        error_count = 0
+                        continue
+                    
+                    # Special case: SET responses may be headerless
                     if len(self._buffer) >= 6 and self._buffer[:2] == b"\r\n":
-                        print(
-                            "[DEBUG] _process_buffer: Detected headerless SET response (\\r\\n + payload)"
-                        )
-                        # This is likely a SET response: \r\n + encrypted ACK (usually 4 bytes)
-                        # Treat as successful SET response
                         msg_source = "set_response"
-                        data = {"status": 0}  # Assume success
-                        print(
-                            "[DEBUG] _process_buffer: Treating as SET response, removing 6 bytes"
-                        )
+                        data = {"status": 0}
                         async with self._buffer_lock:
                             self._buffer = bytearray(self._buffer[6:])
-                        # Continue to routing (skip message size calculation for headerless response)
                     else:
-                        error_count = (
-                            0  # Reset error count when we get incomplete (expected)
-                        )
+                        error_count = 0
                         break
                 else:
-                    error_count = 0  # Reset on successful parse
+                    error_count = 0
 
-                # Calculate message size and remove from buffer (only for normal HTTP messages)
-                if msg_source not in (
-                    "set_response",
-                ):  # Skip for headerless SET responses
-                    try:
-                        separator = b"\r\n\r\n"
-                        sep_index = bytes(self._buffer).find(separator)
-                        if sep_index != -1:
-                            # Parse Content-Length
-                            headers_part = bytes(self._buffer)[:sep_index]
-                            headers_str = headers_part.decode("latin-1")
-
-                            content_length = 0
-                            for line in headers_str.split("\r\n"):
-                                if line.lower().startswith("content-length:"):
-                                    try:
-                                        content_length = int(
-                                            line.split(":", 1)[1].strip()
-                                        )
-                                    except ValueError:
-                                        pass
-                                    break
-
-                            # Remove processed message from buffer
-                            message_size = sep_index + 4 + content_length
-                            if len(self._buffer) >= message_size:
-                                # ✅ Ensure _buffer stays as bytearray, not bytes
-                                async with self._buffer_lock:
-                                    self._buffer = bytearray(
-                                        self._buffer[message_size:]
-                                    )
-                                print(
-                                    f"[DEBUG] _process_buffer: Removed {message_size} bytes, remaining: {len(self._buffer)}"
-                                )
-                            else:
-                                print(
-                                    f"[DEBUG] _process_buffer: Incomplete message - need {message_size}, have {len(self._buffer)}"
-                                )
-                                break
-                        else:
-                            print("[DEBUG] _process_buffer: No separator found")
-                            break
-                    except Exception as e:
-                        print(
-                            f"[DEBUG] _process_buffer: Error calculating message size: {e}"
-                        )
+                # Remove processed message from buffer
+                if msg_source not in ("set_response",):
+                    if message_size > 0 and len(self._buffer) >= message_size:
+                        async with self._buffer_lock:
+                            self._buffer = bytearray(self._buffer[message_size:])
+                    elif message_size > 0:
+                        break
+                    else:
                         break
 
                 # Route message based on type
                 if msg_source == "set_response":
-                    # SET response - just silently succeed, no need to route anywhere
-                    print(
-                        "[DEBUG] _process_buffer: SET response processed successfully"
-                    )
+                    pass  # Silently succeed
                 elif msg_source == MessageSource.QUERY_RESPONSE:
-                    # Try to find waiting query - if none, pass to callbacks
-                    print(
-                        f"[DEBUG] _process_buffer: QUERY_RESPONSE received, waiting_queries={len(self._query_futures)}"
-                    )
                     if len(self._query_futures) > 0:
-                        # Set the first waiting future with this response
                         try:
                             query_id = next(iter(self._query_futures))
                             future = self._query_futures.pop(query_id, None)
-                            print(
-                                f"[DEBUG] _process_buffer: Setting result for {query_id}, data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
-                            )
                             if future and not future.done():
                                 future.set_result((msg_source, data))
-                            else:
-                                print(
-                                    "[DEBUG] _process_buffer: Future already done or None"
-                                )
-                        except Exception as e:
-                            print(
-                                f"[DEBUG] _process_buffer: Error setting query future: {e}"
-                            )
-                            # Pass to callbacks instead
+                        except Exception:
                             await self._invoke_callbacks(msg_source, data)
                     else:
-                        # No waiting query, pass to callbacks
-                        print(
-                            "[DEBUG] _process_buffer: No waiting queries, passing to callbacks"
-                        )
                         await self._invoke_callbacks(msg_source, data)
                 else:
-                    # ACTIVE_REPORT or other types - pass to callbacks
-                    print(
-                        f"[DEBUG] _process_buffer: OTHER message type: {msg_source}, passing to callbacks"
-                    )
-                    print(
-                        f"[DEBUG] _process_buffer: ✅ ACTIVE REPORT RECEIVED - routing to {len(self.callbacks)} callbacks"
-                    )
                     await self._invoke_callbacks(msg_source, data)
 
-            except Exception as e:
-                print(f"[DEBUG] _process_buffer: Error processing buffer: {e}")
-                import traceback
-
-                traceback.print_exc()
-                error_count += 1  # Increment error count on failure
-                await asyncio.sleep(0.1)  # Small sleep to avoid tight loop
-                continue  # Continue processing next message in buffer
+            except Exception:
+                error_count += 1
+                await asyncio.sleep(0.1)
+                continue
 
     async def _invoke_callbacks(self, msg_source, data):
         """Invoke all registered callbacks with message."""
@@ -917,10 +703,6 @@ async def set_property_values(
 ):
     """Set property values on the device.
 
-    This function can work in two ways:
-    1. If listener is provided: Use the unified HTTPMessageListener flow (recommended)
-    2. If listener is None: Use direct transport method (backward compatible)
-
     Args:
         tp: Transport object
         security_ctx: Security context for encryption
@@ -928,7 +710,7 @@ async def set_property_values(
         indices: List of property indices to set
         values: List of values to set
         check_readonly: Whether to check readonly flags
-        listener: HTTPMessageListener instance (optional, for unified flow)
+        listener: HTTPMessageListener instance (required for proper operation)
 
     Returns:
         True if successful, False otherwise
@@ -942,10 +724,10 @@ async def set_property_values(
         # Create the SET request
         message = proto_lc.set_prop_vals_request(security_ctx, indices, values)
 
-        # MUST use unified listener flow - never use send_data_and_receive() after listener starts
+        # Listener is required for unified message handling
         if not listener:
             raise RuntimeError(
-                "Listener is required for set_property_values - do not use send_data_and_receive()"
+                "Listener is required for set_property_values"
             )
 
         # Send through listener with Future-based waiting
@@ -1155,32 +937,41 @@ async def main():
     print("==== Session Established ====")
 
     # Create a listener for continuous message processing
-    http_listener = HTTPMessageListener(obj_transport, obj_security, args.verbose)
+    http_listener = HTTPMessageListener(obj_transport, obj_security, client=None, verbose=args.verbose)
+    
+    # Track active reports for display
+    active_reports = []
+    
+    async def on_active_report(msg_source, data):
+        """Handle incoming active reports from ESP32.
+        
+        Active reports are unsolicited messages sent by ESP32 when property values change.
+        """
+        if msg_source == MessageSource.ACTIVE_REPORT:
+            # Store for display
+            active_reports.append(data)
+            # Always show active reports for visibility
+            properties = data.get("properties", [])
+            if properties:
+                # Decode property values (same as get_all_property_values)
+                for prop in properties:
+                    if "value" in prop:
+                        prop["value"] = decode_prop_value(prop, prop["value"])
+                
+                print(f"\n[Active Report] ESP32 sent {len(properties)} property update(s):")
+                for prop in properties:
+                    print(f"  - {prop.get('name', 'unknown')}: {prop.get('value')}")
+    
+    # Register callback to handle active reports
+    http_listener.add_callback(on_active_report)
+    
+    # Start listener
     await http_listener.start()
 
-    # Track received messages for unified handling
-    received_messages = []
-    query_complete_event = asyncio.Event()
-
-    async def on_message_received(msg_source, data):
-        """Handle incoming messages from the listener"""
-        nonlocal received_messages
-        received_messages.append((msg_source, data))
-        query_complete_event.set()
-        if args.verbose:
-            print(f"[Listener] Received {msg_source}: {data}")
-
-    # Register callback for query responses
-    http_listener.add_callback(on_message_received)
-
     while True:
-        # Use unified message handling through listener
-        received_messages = []
-        query_complete_event.clear()
-
         # Create property count request (for unified handling)
         query_request = proto_lc.get_prop_vals_request(
-            obj_security, [i for i in range(10)]
+            obj_security, list(range(10))
         )
 
         try:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 import socket
 import time
 from typing import Any
@@ -24,10 +23,6 @@ from .esp_iot_spec import (
     BINARY_SENSOR_DEVICE_CLASS_MAP,
     DEFAULT_THRESHOLD_ICON,
     ESP32_SENSOR_NAME_MAPPING,
-    GESTURE_ICONS,
-    GESTURE_PICTURES,
-    GESTURE_PICTURES_FOLDER,
-    GESTURE_STATES,
     INPUT_ICON_MAPPING,
     INPUT_TYPE_EVENTS,
     LIGHT_BRIGHTNESS_ESP_MAX,
@@ -258,6 +253,9 @@ def fire_property_events(
             "flip_event": gesture_data.get("Flip Event", None),
             "toss_event": gesture_data.get("Toss Event", None),
             "rotation_event": gesture_data.get("Rotation Event", None),
+            "clap_single_event": gesture_data.get("Clap Single Event", None),
+            "clap_double_event": gesture_data.get("Clap Double Event", None),
+            "clap_triple_event": gesture_data.get("Clap Triple Event", None),
             "sensitivity": gesture_data.get("Sensitivity", None),
         }
         
@@ -613,100 +611,6 @@ def extract_node_id_from_device_info(device_info: dict) -> str:
     node_id = first_identifier[1]
     # Normalize: remove colons and lowercase
     return node_id.replace(":", "").lower()
-
-
-def get_gesture_display_name(gesture: str, power: bool = True) -> str:
-    """Get display name for gesture state.
-
-    Args:
-        gesture: Gesture identifier string
-        power: Whether the gesture sensor is powered on
-
-    Returns:
-        Human-readable gesture display name
-    """
-    if not power:
-        return "Disabled"
-    return GESTURE_STATES.get(gesture, "Idle")
-
-
-def get_gesture_icon(gesture: str, power: bool = True) -> str:
-    """Get Material Design icon for gesture.
-
-    Args:
-        gesture: Gesture identifier string
-        power: Whether the gesture sensor is powered on
-
-    Returns:
-        Material Design icon identifier
-    """
-    if not power:
-        return "mdi:gesture-tap-hold"
-    return GESTURE_ICONS.get(gesture, "mdi:gesture-tap")
-
-
-def check_gesture_pictures_available(component_path) -> bool:
-    """Check if gesture pictures folder exists.
-
-    Args:
-        component_path: Path to the ESP_HA component directory
-
-    Returns:
-        True if pictures folder exists, False otherwise
-    """
-    pictures_path = Path(component_path) / GESTURE_PICTURES_FOLDER
-    exists = pictures_path.is_dir()
-
-    if not exists:
-        _LOGGER.info(
-            "Gesture pictures folder not found at: %s. "
-            "To use custom gesture pictures, create this folder and add images. "
-            "支持的格式: png, jpg, svg, gif",
-            pictures_path,
-        )
-    else:
-        _LOGGER.info("Gesture pictures folder found: %s", pictures_path)
-
-    return exists
-
-
-def get_gesture_picture_url(gesture: str, component_path, use_pictures: bool) -> str | None:
-    """Get the picture URL for a specific gesture.
-
-    Args:
-        gesture: The gesture name (e.g., "shake", "flip")
-        component_path: Path to the ESP_HA component directory
-        use_pictures: Whether picture support is enabled
-
-    Returns:
-        The picture URL if available, None otherwise
-    """
-    if not use_pictures:
-        return None
-
-    # Get the picture filename for this gesture
-    picture_name = GESTURE_PICTURES.get(gesture, "idle")
-
-    # Try different image extensions
-    extensions = [".png", ".jpg", ".jpeg", ".svg", ".gif"]
-
-    pictures_path = Path(component_path) / GESTURE_PICTURES_FOLDER
-
-    for ext in extensions:
-        full_path = pictures_path / f"{picture_name}{ext}"
-        if full_path.is_file():
-            # Return relative file path - dashboard will use this
-            return f"/api/esp_ha/gesture_images/{picture_name}{ext}"
-
-    # If no picture found for this gesture, try idle as fallback
-    if gesture != "idle":
-        for ext in extensions:
-            full_path = pictures_path / f"idle{ext}"
-            if full_path.is_file():
-                return f"/api/esp_ha/gesture_images/idle{ext}"
-
-    _LOGGER.debug("No picture found for gesture: %s", gesture)
-    return None
 
 
 def get_input_icon(input_type: str, last_event: str) -> str:

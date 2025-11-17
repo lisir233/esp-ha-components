@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, get_device_info
-from .esp_iot import (
-    check_gesture_pictures_available,
-    get_gesture_display_name,
-    get_gesture_icon,
-)
+from .esp_iot.esp_iot_spec import GESTURE_ICONS, GESTURE_STATES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,21 +49,15 @@ class ESPHomeIMUGesture(SensorEntity):
         self._flip_event = False
         self._toss_event = False
         self._rotation_event = False
+        self._clap_single_event = False
+        self._clap_double_event = False
+        self._clap_triple_event = False
 
         # Internal timer duration
         self._gesture_display_duration = 2.0
         self._reset_timer = None
 
-        # Picture support
-        component_path = Path(__file__).parent
-        self._use_pictures = check_gesture_pictures_available(component_path)
-        self._attr_entity_picture = None
-
-        _LOGGER.debug(
-            "Initialized IMU gesture sensor: %s (Pictures: %s)",
-            device_name,
-            "Enabled" if self._use_pictures else "Disabled",
-        )
+        _LOGGER.debug("Initialized IMU gesture sensor: %s", device_name)
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to gesture events when added to HA."""
@@ -114,7 +103,10 @@ class ESPHomeIMUGesture(SensorEntity):
             self._flip_event = False
             self._toss_event = False
             self._rotation_event = False
-            
+            self._clap_single_event = False
+            self._clap_double_event = False
+            self._clap_triple_event = False
+
             self.async_write_ha_state()
             _LOGGER.debug(
                 "Reset all event flags to False after %.1fs",
@@ -203,7 +195,7 @@ class ESPHomeIMUGesture(SensorEntity):
                 # Treat "none" as "idle" since they both represent no active gesture
                 if gesture_type == "none":
                     gesture_type = "idle"
-                if gesture_type in ["idle", "shake", "push", "circle", "flip", "toss", "rotation"]:
+                if gesture_type in ["idle", "shake", "push", "circle", "flip", "toss", "rotation", "clap_single", "clap_double", "clap_triple"]:
                     old_gesture = self._gesture
                     self._gesture = gesture_type
                     _LOGGER.info("Updated gesture type: %s -> %s", old_gesture, self._gesture)
@@ -252,60 +244,110 @@ class ESPHomeIMUGesture(SensorEntity):
                 _LOGGER.info("Updated power: %s", self._power)
             
             # Update event flags
-            # When an event is triggered, also start the auto-reset timer
-            # IMPORTANT: Only set flags to True when ESP32 reports True
-            # Ignore False values from ESP32 - let the auto-reset timer handle resetting to False
-            # 重要：只在 ESP32 上报 True 时设置标志位为 True
-            # 忽略 ESP32 发来的 False 值 - 让自动重置定时器负责将标志位重置为 False
+            # Process both True and False events from ESP32 to support automation triggers
+            # like "from: false to: true" or "from: true to: false"
+            # 处理来自 ESP32 的 True 和 False 事件，以支持自动化触发器
+            # 例如 "from: false to: true" 或 "from: true to: false"
             gesture_triggered = False
             
             if "shake_event" in sensor_data and sensor_data["shake_event"] is not None:
                 event_value = bool(sensor_data["shake_event"])
-                if event_value:  # Only process True events
-                    self._shake_event = True
+                old_value = self._shake_event
+                self._shake_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "shake"
                     gesture_triggered = True
-                    _LOGGER.info("Shake event triggered")
+                    _LOGGER.info("Shake event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Shake event reset (True -> False)")
             
             if "push_event" in sensor_data and sensor_data["push_event"] is not None:
                 event_value = bool(sensor_data["push_event"])
-                if event_value:  # Only process True events
-                    self._push_event = True
+                old_value = self._push_event
+                self._push_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "push"
                     gesture_triggered = True
-                    _LOGGER.info("Push event triggered")
+                    _LOGGER.info("Push event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Push event reset (True -> False)")
             
             if "circle_event" in sensor_data and sensor_data["circle_event"] is not None:
                 event_value = bool(sensor_data["circle_event"])
-                if event_value:  # Only process True events
-                    self._circle_event = True
+                old_value = self._circle_event
+                self._circle_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "circle"
                     gesture_triggered = True
-                    _LOGGER.info("Circle event triggered")
+                    _LOGGER.info("Circle event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Circle event reset (True -> False)")
             
             if "flip_event" in sensor_data and sensor_data["flip_event"] is not None:
                 event_value = bool(sensor_data["flip_event"])
-                if event_value:  # Only process True events
-                    self._flip_event = True
+                old_value = self._flip_event
+                self._flip_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "flip"
                     gesture_triggered = True
-                    _LOGGER.info("Flip event triggered")
+                    _LOGGER.info("Flip event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Flip event reset (True -> False)")
             
             if "toss_event" in sensor_data and sensor_data["toss_event"] is not None:
                 event_value = bool(sensor_data["toss_event"])
-                if event_value:  # Only process True events
-                    self._toss_event = True
+                old_value = self._toss_event
+                self._toss_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "toss"
                     gesture_triggered = True
-                    _LOGGER.info("Toss event triggered")
+                    _LOGGER.info("Toss event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Toss event reset (True -> False)")
             
             if "rotation_event" in sensor_data and sensor_data["rotation_event"] is not None:
                 event_value = bool(sensor_data["rotation_event"])
-                if event_value:  # Only process True events
-                    self._rotation_event = True
+                old_value = self._rotation_event
+                self._rotation_event = event_value
+                if event_value and not old_value:  # Transition from False to True
                     self._gesture = "rotation"
                     gesture_triggered = True
-                    _LOGGER.info("Rotation event triggered")
+                    _LOGGER.info("Rotation event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Rotation event reset (True -> False)")
+            
+            if "clap_single_event" in sensor_data and sensor_data["clap_single_event"] is not None:
+                event_value = bool(sensor_data["clap_single_event"])
+                old_value = self._clap_single_event
+                self._clap_single_event = event_value
+                if event_value and not old_value:  # Transition from False to True
+                    self._gesture = "clap_single"
+                    gesture_triggered = True
+                    _LOGGER.info("Clap single event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Clap single event reset (True -> False)")
+            
+            if "clap_double_event" in sensor_data and sensor_data["clap_double_event"] is not None:
+                event_value = bool(sensor_data["clap_double_event"])
+                old_value = self._clap_double_event
+                self._clap_double_event = event_value
+                if event_value and not old_value:  # Transition from False to True
+                    self._gesture = "clap_double"
+                    gesture_triggered = True
+                    _LOGGER.info("Clap double event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Clap double event reset (True -> False)")
+            
+            if "clap_triple_event" in sensor_data and sensor_data["clap_triple_event"] is not None:
+                event_value = bool(sensor_data["clap_triple_event"])
+                old_value = self._clap_triple_event
+                self._clap_triple_event = event_value
+                if event_value and not old_value:  # Transition from False to True
+                    self._gesture = "clap_triple"
+                    gesture_triggered = True
+                    _LOGGER.info("Clap triple event triggered (False -> True)")
+                elif not event_value and old_value:  # Transition from True to False
+                    _LOGGER.info("Clap triple event reset (True -> False)")
             
             # Start auto-reset timer if a gesture event was triggered
             if gesture_triggered:
@@ -322,11 +364,6 @@ class ESPHomeIMUGesture(SensorEntity):
                 self._sensitivity = int(sensor_data["sensitivity"])
                 _LOGGER.info("Updated sensitivity: %d", self._sensitivity)
 
-            # Don't update entity_picture - keep small icon for consistency with other entities
-            # Picture URL is available via extra_state_attributes for dashboard use
-            # 不更新entity_picture - 保持小图标以与其他实体一致
-            # 图片URL通过extra_state_attributes提供给Dashboard使用
-
             self.async_write_ha_state()
 
         except Exception:  # Broad exception acceptable for callback event handling
@@ -336,7 +373,9 @@ class ESPHomeIMUGesture(SensorEntity):
     def native_value(self) -> str:
         """Return current gesture state."""
         power = getattr(self, "_power", True)  # Default to True if not set
-        return get_gesture_display_name(self._gesture, power)
+        if not power:
+            return "Off"
+        return GESTURE_STATES.get(self._gesture, self._gesture.replace("_", " ").title())
 
     @property
     def available(self) -> bool:
@@ -350,20 +389,27 @@ class ESPHomeIMUGesture(SensorEntity):
     def icon(self) -> str:
         """Return icon based on current gesture."""
         power = getattr(self, "_power", True)  # Default to True if not set
-        return get_gesture_icon(self._gesture, power)
+        if not power:
+            return "mdi:power-off"
+        return GESTURE_ICONS.get(self._gesture, "mdi:gesture-tap")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional state attributes."""
+        # Return event flags as lowercase strings to match HA UI automation format
+        # HA UI saves automations with quoted lowercase strings: from: 'false' to: 'true'
         attrs = {
             "gesture": self._gesture,
             "confidence": self._confidence,
-            "push_event": self._push_event,
-            "shake_event": self._shake_event,
-            "circle_event": self._circle_event,
-            "flip_event": self._flip_event,
-            "toss_event": self._toss_event,
-            "rotation_event": self._rotation_event,
+            "push_event": str(self._push_event).lower(),
+            "shake_event": str(self._shake_event).lower(),
+            "circle_event": str(self._circle_event).lower(),
+            "flip_event": str(self._flip_event).lower(),
+            "toss_event": str(self._toss_event).lower(),
+            "rotation_event": str(self._rotation_event).lower(),
+            "clap_single_event": str(self._clap_single_event).lower(),
+            "clap_double_event": str(self._clap_double_event).lower(),
+            "clap_triple_event": str(self._clap_triple_event).lower(),
         }
 
         if hasattr(self, "_orientation_x"):

@@ -11,8 +11,8 @@ from typing import Any
 _LOGGER = logging.getLogger(__name__)
 
 # Connection timeouts
-POP_TEST_DELAY = 1.0
-POP_TEST_DISCONNECT_DELAY = 10.0
+POP_TEST_DELAY = 0.5  # Reduced from 1.0s - minimal delay needed before connection
+POP_TEST_DISCONNECT_DELAY = 0.5  # Reduced from 10s to 0.5s - brief delay for ESP to release resources
 
 
 class ESPSecurityManager:

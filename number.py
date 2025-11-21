@@ -78,7 +78,7 @@ async def async_setup_entry(
 
             # Extract device_name from device_info if not provided in event
             device_name = event_data.get("device_name", "") or device_info.get(
-                "name", f"ESP {event_node_id}"
+                "name", f"ESP-{event_node_id}"
             )
 
             if not event_node_id or not device_info or not param_name:
@@ -95,7 +95,6 @@ async def async_setup_entry(
                         hass=hass,
                         node_id=event_node_id,
                         device_name=device_name,
-                        device_info=device_info,
                         param_type="battery_low_threshold",
                         param_name=param_name,
                     )
@@ -111,7 +110,6 @@ async def async_setup_entry(
                         hass=hass,
                         node_id=event_node_id,
                         device_name=device_name,
-                        device_info=device_info,
                         param_type="battery_sampling_interval",
                         param_name=param_name,
                     )
@@ -147,7 +145,6 @@ async def async_setup_entry(
                                 hass=hass,
                                 node_id=event_node_id,
                                 device_name=device_info.get("name", ""),
-                                device_info=device_info,
                                 param_type="battery_low_threshold",
                                 param_name=param_name,
                             )
@@ -162,7 +159,6 @@ async def async_setup_entry(
                                 hass=hass,
                                 node_id=event_node_id,
                                 device_name=device_info.get("name", ""),
-                                device_info=device_info,
                                 param_type="battery_sampling_interval",
                                 param_name=param_name,
                             )
@@ -244,19 +240,17 @@ async def async_setup_entry(
                     if entity_key in discovered_entities:
                         continue
 
-                    # 使用事件中的完整 device_info
-                    device_info = event.data.get("device_info", {}).copy()
-                    if not device_info.get("node_id"):
-                        device_info["node_id"] = processed_node_id
-                    if not device_info.get("name"):
-                        device_info["name"] = f"ESP {processed_node_id}"
+                    # 使用事件中的完整 device_info 提取所需字段
+                    event_device_info = event.data.get("device_info", {})
+                    device_name = event_device_info.get("name") or f"ESP-{processed_node_id}"
 
                     # 创建阈值数字实体 - 修复：传递正确的参数
                     _LOGGER.debug(
-                        "正在创建阈值实体: type=%s, threshold=%s, device=%s",
+                        "正在创建阈值实体: type=%s, threshold=%s, node_id=%s, device_name=%s",
                         sensor_type,
                         threshold_type,
-                        device_info,
+                        processed_node_id,
+                        device_name,
                     )
 
                     # Check if API is available
@@ -267,9 +261,10 @@ async def async_setup_entry(
                         continue
 
                     threshold_entity = ESPHomeThresholdNumber(
-                        hass=hass,  # 添加hass参数
-                        api=api,  # 使用从entry_data获取的api实例
-                        device_info=device_info,
+                        hass=hass,
+                        api=api,
+                        node_id=processed_node_id,
+                        device_name=device_name,
                         sensor_type=sensor_type,
                         threshold_type=threshold_type,
                         sensor_name=sensor_name,
@@ -327,9 +322,7 @@ async def async_setup_entry(
                     if not sensor_entity:
                         continue
                     sensor_type = getattr(sensor_entity, "_sensor_type", "").lower()
-                    entity_node_id = getattr(sensor_entity, "_device_info", {}).get(
-                        "node_id", ""
-                    )
+                    entity_node_id = getattr(sensor_entity, "_node_id", "")
                     sensor_name = getattr(sensor_entity, "name", None) or getattr(
                         sensor_entity, "_attr_name", ""
                     )
@@ -361,7 +354,7 @@ async def async_setup_entry(
                             "sensor_name": sensor_name,
                             "device_info": {
                                 "node_id": entity_node_id,
-                                "name": f"ESP {entity_node_id!s}",
+                                "name": f"ESP-{entity_node_id!s}",
                             },
                         },
                     )
@@ -406,7 +399,7 @@ async def async_setup_entry(
                             "sensor_type": threshold_entity._sensor_type,
                             "threshold_type": threshold_entity._threshold_type,
                             "value": threshold_entity.native_value,
-                            "node_id": threshold_entity._device_info["node_id"],
+                            "node_id": threshold_entity._node_id,
                         }
 
                     except Exception:
@@ -445,7 +438,8 @@ class ESPHomeThresholdNumber(NumberEntity):
         self,
         hass: HomeAssistant,
         api: Any,
-        device_info: dict,
+        node_id: str,
+        device_name: str,
         sensor_type: str,
         threshold_type: str,  # "min" or "max"
         sensor_name: str,
@@ -455,19 +449,15 @@ class ESPHomeThresholdNumber(NumberEntity):
         NumberEntity.__init__(self)
         self._hass = hass
         # Note: api parameter is not stored to avoid JSON serialization issues
-        self._device_info = device_info
+        self._node_id = str(node_id).replace(":", "").lower()
+        self._device_name = device_name
         self._sensor_type = sensor_type
         self._threshold_type = threshold_type
         self._sensor_name = sensor_name
 
-        # 生成唯一ID - 保持node_id的原始格式
-        node_id = (
-            str(device_info.get("node_id", "unknown")).replace(":", "").strip().lower()
-        )
-
         # 使用新版本unique_id
         self._attr_unique_id = (
-            f"{DOMAIN}_{node_id}_{sensor_type}_{threshold_type}_threshold"
+            f"{DOMAIN}_{self._node_id}_{sensor_type}_{threshold_type}_threshold"
         )
 
         # 设置实体名称 - 使用has_entity_name，让HA自动组合设备名
@@ -483,9 +473,7 @@ class ESPHomeThresholdNumber(NumberEntity):
         self._setup_number_range()
 
         # 设置设备关联 - 使用导入的get_device_info函数
-        self._attr_device_info = get_device_info(
-            device_info["node_id"], device_info["name"]
-        )
+        self._attr_device_info = get_device_info(self._node_id, device_name)
 
         # 不设置entity_category，让阈值实体显示在主要控制区域（类似传感器）
         # 这样它们会出现在Overview和主要实体列表中
@@ -561,15 +549,14 @@ class ESPHomeThresholdNumber(NumberEntity):
 
             # 检查是否为Battery Sampling Interval实体
             if (
-                "battery_sampling_interval" in self.entity_id.lower()
-                or "battery sampling interval" in self._attr_name.lower()
+                "sampling_interval" in self.entity_id.lower()
+                or "sampling interval" in self._attr_name.lower()
             ):
-                # 这是Battery Sampling Interval实体，直接发送采样间隔事件
-                node_id = self._device_info.get("node_id", "").replace(":", "").lower()
+                # 这是Sampling Interval实体，发送采样间隔事件
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_set_sampling_interval",
                     {
-                        "node_id": node_id,
+                        "node_id": self._node_id,
                         "interval_sec": int(value),
                         "reason": "manual_adjustment",
                         "source": "battery_energy",
@@ -580,10 +567,9 @@ class ESPHomeThresholdNumber(NumberEntity):
                 or "battery low threshold" in self._attr_name.lower()
             ):
                 # 这是Battery Low Threshold实体，发送阈值事件
-                node_id = self._device_info.get("node_id", "").replace(":", "").lower()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_set_battery_low_threshold",
-                    {"node_id": node_id, "low_threshold": int(value)},
+                    {"node_id": self._node_id, "low_threshold": int(value)},
                 )
             else:
                 # 普通传感器阈值，使用原有逻辑
@@ -599,8 +585,6 @@ class ESPHomeThresholdNumber(NumberEntity):
     async def async_send_to_esp32(self) -> None:
         """Send current threshold to ESP32 device."""
         try:
-            node_id = self._device_info["node_id"].lower()
-
             param_name = get_esp32_threshold_param_name(self._sensor_type, self._threshold_type)
             value = self._attr_native_value
 
@@ -618,7 +602,7 @@ class ESPHomeThresholdNumber(NumberEntity):
             self.hass.bus.async_fire(
                 f"{DOMAIN}_threshold_update_to_esp32",
                 {
-                    "node_id": node_id,
+                    "node_id": self._node_id,
                     "param_name": param_name,
                     "value": value,
                     "sensor_type": self._sensor_type,
@@ -678,10 +662,9 @@ class ESPHomeThresholdNumber(NumberEntity):
             try:
                 # Normalize node_id to lowercase for comparison
                 event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
-                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
 
                 # Filter: only process events for this device
-                if not event_node_id or not device_node_id or event_node_id != device_node_id:
+                if not event_node_id or event_node_id != self._node_id:
                     return
 
                 event_param = event.data.get("param_name", "")
@@ -726,13 +709,12 @@ class ESPHomeThresholdNumber(NumberEntity):
             """Handle device availability change."""
             try:
                 event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
-                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
 
-                if event_node_id == device_node_id:
+                if event_node_id == self._node_id:
                     available = event.data.get("available", False)
                     _LOGGER.debug(
                         "Device %s availability changed to %s, updating threshold entity %s",
-                        device_node_id,
+                        self._node_id,
                         "available" if available else "unavailable",
                         self._attr_unique_id,
                     )
@@ -753,8 +735,7 @@ class ESPHomeThresholdNumber(NumberEntity):
         """Return True if entity is available (device is connected)."""
         api = self._hass.data.get(DOMAIN, {}).get("shared_api")
         if api:
-            node_id = str(self._device_info["node_id"]).lower()
-            return api.is_device_available(node_id)
+            return api.is_device_available(self._node_id)
         return False
 
     @property
@@ -779,7 +760,6 @@ class ESPHomeBatteryConfigNumber(NumberEntity):
         hass: HomeAssistant,
         node_id: str,
         device_name: str,
-        device_info: dict,
         param_type: str,
         param_name: str,
     ) -> None:
@@ -788,7 +768,6 @@ class ESPHomeBatteryConfigNumber(NumberEntity):
         self._hass = hass
         self._node_id = str(node_id).replace(":", "").lower()
         self._device_name = device_name
-        self._device_info = device_info
         self._param_type = param_type
         self._param_name = param_name
 
@@ -886,7 +865,7 @@ class ESPHomeBatteryConfigNumber(NumberEntity):
             """Handle device availability change."""
             try:
                 event_node_id = str(event.data.get("node_id", "")).replace(":", "").strip().lower()
-                device_node_id = str(self._device_info.get("node_id", "")).replace(":", "").strip().lower()
+                device_node_id = self._node_id
 
                 if event_node_id == device_node_id:
                     available = event.data.get("available", False)

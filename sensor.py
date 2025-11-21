@@ -28,9 +28,9 @@ from homeassistant.const import (
     UnitOfPressure,
     UnitOfTemperature,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType
 
 from .battery_energy import ESPHomeBatteryEnergy
 from .const import CONF_NODE_ID, DOMAIN, get_device_info
@@ -70,7 +70,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigType,
+    config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> bool:
     """Set up sensor platform from config entry.
@@ -132,11 +132,7 @@ async def async_setup_entry(
             battery_entity = ESPHomeBatteryEnergy(
                 hass=hass,
                 node_id=node_id,
-                device_name=config_entry.title or f"ESP {node_id}",
-                device_info={
-                    "node_id": node_id,
-                    "name": config_entry.title or f"ESP {node_id}",
-                },
+                device_name=config_entry.title or f"ESP-{node_id}",
             )
             entities.append(battery_entity)
             async_add_entities([battery_entity])
@@ -160,12 +156,8 @@ async def async_setup_entry(
             gesture_entity = ESPHomeIMUGesture(
                 hass=hass,
                 api=api,
-                device_info={
-                    "node_id": node_id,
-                    "name": config_entry.title or f"ESP {node_id}",
-                },
-                device_name=config_entry.title or f"ESP {node_id}",
                 node_id=node_id,
+                device_name=config_entry.title or f"ESP-{node_id}",
             )
             entities.append(gesture_entity)
             async_add_entities([gesture_entity])
@@ -189,11 +181,7 @@ async def async_setup_entry(
             input_entity = ESPHomeInteractiveInput(
                 hass=hass,
                 node_id=node_id,
-                device_name=config_entry.title or f"ESP {node_id}",
-                device_info={
-                    "node_id": node_id,
-                    "name": config_entry.title or f"ESP {node_id}",
-                },
+                device_name=config_entry.title or f"ESP-{node_id}",
             )
             entities.append(input_entity)
             async_add_entities([input_entity])
@@ -217,11 +205,7 @@ async def async_setup_entry(
             sleep_entity = ESPHomeLowPowerSleep(
                 hass=hass,
                 node_id=node_id,
-                device_name=config_entry.title or f"ESP {node_id}",
-                device_info={
-                    "node_id": node_id,
-                    "name": config_entry.title or f"ESP {node_id}",
-                },
+                device_name=config_entry.title or f"ESP-{node_id}",
             )
             entities.append(sleep_entity)
             async_add_entities([sleep_entity])
@@ -277,7 +261,7 @@ async def async_setup_entry(
                         "node_id": node_id,
                         "sensor_type": sensor_type,
                         "sensor_name": f"{sensor_type.replace('_', ' ').title()} Sensor",
-                        "device_info": {"node_id": node_id, "name": f"ESP {node_id}"},
+                        "device_info": {"node_id": node_id, "name": f"ESP-{node_id}"},
                         "threshold_data": {
                             k: v for k, v in threshold_data.items() if sensor_type in k
                         },
@@ -437,17 +421,19 @@ async def async_setup_entry(
                     or ""
                 )
 
+                # Get device name from device_info (preferred) or event data or use default format
+                device_name = (
+                    device_info.get("name")  # Prefer from device_info
+                    or event.data.get("device_name")  # Fallback to event data
+                    or f"ESP-{node_id}"  # Last resort: default format
+                )
+                
                 # Create discovered sensor entity - fix: pass all required parameters
                 discovered_entity = ESPHomeSensor(
                     hass=hass,
                     api=api,  # API instance
-                    device_info={
-                        "node_id": str(event.data.get("node_id", ""))
-                        .replace(":", "")
-                        .lower(),
-                        "ip": "",  # Will be obtained from API
-                        "name": f"ESP {node_id}",  # Use standard device name
-                    },
+                    node_id=str(event.data.get("node_id", "")).replace(":", "").lower(),
+                    device_name=device_name,
                     sensor_type=sensor_type,
                     name=sensor_name,
                     unit=final_unit or "",
@@ -1354,7 +1340,7 @@ async def async_setup_entry(
                 for entity_id, entity in all_discovered.items():
                     summary["sensors"][entity_id] = {
                         "sensor_type": entity._sensor_type,
-                        "node_id": entity._device_info.get("node_id", "unknown"),
+                        "node_id": entity._node_id,
                         "last_value": entity._attr_native_value,
                         "available": entity._attr_available,
                         "source": "local",
@@ -1556,14 +1542,15 @@ class ESPHomeSensor(SensorEntity):
         self,
         hass: HomeAssistant,
         api: Any,
-        device_info: dict,
+        node_id: str,
+        device_name: str,
         sensor_type: str,
         name: str,
         unit: str,
         device_class: str,
         state_class: str,
         is_discovery: bool = False,
-        param_info: dict = None,
+        param_info: dict | None = None,
         current_value: Any = None,
     ) -> None:
         """Initialize the sensor entity.
@@ -1571,7 +1558,8 @@ class ESPHomeSensor(SensorEntity):
         Args:
             hass: Home Assistant instance.
             api: API instance for device communication.
-            device_info: Device information dictionary.
+            node_id: Device node ID.
+            device_name: Device name.
             sensor_type: Type of sensor (temperature, humidity, etc.).
             name: Display name for the sensor.
             unit: Unit of measurement.
@@ -1584,8 +1572,8 @@ class ESPHomeSensor(SensorEntity):
         SensorEntity.__init__(self)
         self._hass = hass
         self._api = api
-        self._device_info = device_info
-        self._node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
+        self._node_id = str(node_id).replace(":", "").lower()
+        self._device_name = device_name
         self._sensor_type = sensor_type
         self._is_discovery = is_discovery
         self._param_info = param_info or {}
@@ -1593,8 +1581,8 @@ class ESPHomeSensor(SensorEntity):
         # Setup entity through extracted methods
         self._setup_entity_naming(sensor_type)
         self._setup_device_class_and_unit(sensor_type, unit, device_class, state_class)
-        self._setup_unique_id(device_info, sensor_type, is_discovery)
-        self._setup_device_info(device_info)
+        self._setup_unique_id(sensor_type, is_discovery)
+        self._setup_device_info()
         self._initialize_state_tracking()
         self._set_initial_value(is_discovery, current_value, param_info)
 
@@ -1645,30 +1633,24 @@ class ESPHomeSensor(SensorEntity):
             )
 
     def _setup_unique_id(
-        self, device_info: dict, sensor_type: str, is_discovery: bool
+        self, sensor_type: str, is_discovery: bool
     ) -> None:
         """Generate unique ID for the entity.
 
         Args:
-            device_info: Device information dictionary.
             sensor_type: Type of sensor.
             is_discovery: Whether this is a discovered sensor.
         """
-        node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
         if is_discovery:
-            self._attr_unique_id = f"{DOMAIN}_{node_id}_{sensor_type}"
+            self._attr_unique_id = f"{DOMAIN}_{self._node_id}_{sensor_type}"
         else:
-            self._attr_unique_id = f"{DOMAIN}_{node_id}_{sensor_type}_legacy"
+            self._attr_unique_id = f"{DOMAIN}_{self._node_id}_{sensor_type}_legacy"
 
-    def _setup_device_info(self, device_info: dict) -> None:
-        """Setup device information for entity.
-
-        Args:
-            device_info: Device information dictionary.
-        """
-        self._attr_device_info = get_device_info(
-            device_info["node_id"], device_info.get("name", "ESP Device")
-        )
+    def _setup_device_info(self) -> None:
+        """Setup device information for entity."""
+        # Use get_device_info like other entities (binary_sensor, light, number)
+        # This ensures consistent device registration across all entity types
+        self._attr_device_info = get_device_info(self._node_id, self._device_name)
 
     def _initialize_state_tracking(self) -> None:
         """Initialize state tracking variables."""
@@ -1851,17 +1833,16 @@ class ESPHomeSensor(SensorEntity):
         try:
             # Use mapped sensor type for number entity names
             mapped_sensor_type = get_sensor_mapped_type(sensor_type)
-            node_id = self._device_info.get("node_id", "").lower()
 
             threshold_attrs = {}
 
             # Number entity naming must be consistent with IDs created by number platform
             raw_for_number = self._sensor_type.lower()
             min_number_id = build_sensor_number_entity_id(
-                DOMAIN, node_id, raw_for_number, "min"
+                DOMAIN, self._node_id, raw_for_number, "min"
             )
             max_number_id = build_sensor_number_entity_id(
-                DOMAIN, node_id, raw_for_number, "max"
+                DOMAIN, self._node_id, raw_for_number, "max"
             )
 
             # Read minimum threshold
@@ -2010,12 +1991,10 @@ class ESPHomeSensor(SensorEntity):
     async def _sync_threshold_to_esp32(self, param_name: str, value: Any):
         """Sync threshold parameters to ESP32 device"""
         try:
-            node_id = self._device_info.get("node_id", "").lower()
-
             # Sync parameters to ESP32 via API
-            if hasattr(self._api, "devices") and node_id in self._api.devices:
+            if hasattr(self._api, "devices") and self._node_id in self._api.devices:
                 # Update local parameters
-                device_data = self._api.devices[node_id]
+                device_data = self._api.devices[self._node_id]
                 if "params" not in device_data:
                     device_data["params"] = {}
 
@@ -2024,7 +2003,7 @@ class ESPHomeSensor(SensorEntity):
                 # Send to ESP32 device
                 update_data = {param_name: value}
                 success = await self._api.send_device_command(
-                    node_id, "set_thresholds", update_data
+                    self._node_id, "set_thresholds", update_data
                 )
 
                 if success:
@@ -2038,7 +2017,7 @@ class ESPHomeSensor(SensorEntity):
                         "Failed to sync threshold parameter to ESP32: %s", param_name
                     )
             else:
-                _LOGGER.warning("Device not found, cannot sync threshold: %s", node_id)
+                _LOGGER.warning("Device not found, cannot sync threshold: %s", self._node_id)
 
         except Exception as err:
             _LOGGER.error("Failed to sync thresholds to ESP32: %s", err)
@@ -2103,11 +2082,9 @@ class ESPHomeSensor(SensorEntity):
             if not self._is_discovery or not self._param_info:
                 return
 
-            node_id = self._device_info["node_id"].lower()
-
             # Get current device value from API
-            if hasattr(self._api, "devices") and node_id in self._api.devices:
-                device_data = self._api.devices[node_id]
+            if hasattr(self._api, "devices") and self._node_id in self._api.devices:
+                device_data = self._api.devices[self._node_id]
                 current_values = device_data.get("current_values", {})
 
                 # Get corresponding value based on sensor type
@@ -2153,10 +2130,9 @@ class ESPHomeSensor(SensorEntity):
         try:
             # Normalize node_id to lowercase for comparison
             event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
-            device_node_id = str(self._device_info["node_id"]).replace(":", "").lower()
 
             # Only update if this event is for our device
-            if event_node_id == device_node_id:
+            if event_node_id == self._node_id:
                 available = event.data.get("available", False)
                 _LOGGER.debug(
                     "Device %s availability changed to %s, updating sensor entity %s",
@@ -2178,10 +2154,9 @@ class ESPHomeSensor(SensorEntity):
         try:
             # Normalize node_id to lowercase for comparison
             event_node_id = str(event.data["node_id"]).replace(":", "").lower()
-            device_node_id = str(self._device_info["node_id"]).replace(":", "").lower()
 
             # Check if node_id matches
-            if event_node_id != device_node_id:
+            if event_node_id != self._node_id:
                 return
 
             # Check if sensor type matches
@@ -2366,7 +2341,6 @@ class ESPHomeSensor(SensorEntity):
 
             raw_sensor_type = self._sensor_type.lower()
             sensor_type = sensor_type_mapping.get(raw_sensor_type, raw_sensor_type)
-            node_id = self._device_info["node_id"].lower()
 
             _LOGGER.debug(
                 "Checking thresholds for sensor: %s=%s", sensor_type, current_value
@@ -2375,12 +2349,12 @@ class ESPHomeSensor(SensorEntity):
             # Get threshold values from number entities (not helpers)
             # Keep consistent with IDs created by number entities (number platform uses original sensor_type to generate entity_id)
             raw_for_number = self._sensor_type.lower()
-            min_number_id = f"number.{DOMAIN}_{node_id}_{raw_for_number}_min_threshold"
-            max_number_id = f"number.{DOMAIN}_{node_id}_{raw_for_number}_max_threshold"
+            min_number_id = f"number.{DOMAIN}_{self._node_id}_{raw_for_number}_min_threshold"
+            max_number_id = f"number.{DOMAIN}_{self._node_id}_{raw_for_number}_max_threshold"
 
             # Also try pinyin entity ID format (esp_39cc_huan_jing_wen_du_zui_da_yu_zhi)
-            pinyin_min_id = f"number.esp_{node_id}_{raw_for_number}_zui_xiao_yu_zhi"
-            pinyin_max_id = f"number.esp_{node_id}_{raw_for_number}_zui_da_yu_zhi"
+            pinyin_min_id = f"number.esp_{self._node_id}_{raw_for_number}_zui_xiao_yu_zhi"
+            pinyin_max_id = f"number.esp_{self._node_id}_{raw_for_number}_zui_da_yu_zhi"
 
             # Get threshold values from number entities - try multiple formats
             min_state = self.hass.states.get(min_number_id)
@@ -2438,9 +2412,7 @@ class ESPHomeSensor(SensorEntity):
             unit = unit_map.get(sensor_type, "")
 
             # Check for threshold violations
-            device_name = (
-                self._device_info.get("name", "ESP32") if self._device_info else "ESP32"
-            )
+            device_name = self._device_name
             alert_created = False
 
             # Check high threshold
@@ -2515,7 +2487,7 @@ class ESPHomeSensor(SensorEntity):
                         "max_threshold": max_threshold,
                         "unit": unit,
                         "device_name": device_name,
-                        "node_id": self._device_info["node_id"],
+                        "node_id": self._node_id,
                     },
                 )
 
@@ -2532,8 +2504,6 @@ class ESPHomeSensor(SensorEntity):
     ) -> None:
         """Send threshold alert to ESP32 device."""
         try:
-            node_id = self._device_info["node_id"].lower()
-
             # Build alarm message using utility function
             alert_message = build_threshold_alert_message(
                 sensor_type, alert_type, current_value, threshold_value, unit
@@ -2546,7 +2516,7 @@ class ESPHomeSensor(SensorEntity):
                 return
 
             await api_instance.send_device_command(
-                node_id=node_id,
+                node_id=self._node_id,
                 command_type="threshold_alert",
                 parameters={
                     "alert_message": alert_message,
@@ -2567,8 +2537,6 @@ class ESPHomeSensor(SensorEntity):
     ) -> None:
         """Send threshold alert clear to ESP32 device."""
         try:
-            node_id = self._device_info["node_id"].lower()
-
             # Build alarm clear message using utility function
             clear_message = build_threshold_clear_message(
                 sensor_type, current_value, unit
@@ -2581,7 +2549,7 @@ class ESPHomeSensor(SensorEntity):
                 return
 
             await api_instance.send_device_command(
-                node_id=node_id,
+                node_id=self._node_id,
                 command_type="threshold_alert_clear",
                 parameters={
                     "clear_message": clear_message,

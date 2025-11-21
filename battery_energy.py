@@ -28,7 +28,6 @@ class ESPHomeBatteryEnergy(SensorEntity):
         hass: HomeAssistant,
         node_id: str,
         device_name: str,
-        device_info: dict[str, Any],
     ) -> None:
         """Initialize the Battery entity."""
         self.hass = hass

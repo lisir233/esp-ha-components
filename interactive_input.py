@@ -31,14 +31,12 @@ class ESPHomeInteractiveInput(SensorEntity):
         hass: HomeAssistant,
         node_id: str,
         device_name: str,
-        device_info: dict[str, Any],
     ) -> None:
         """Initialize the Interactive Input entity."""
         SensorEntity.__init__(self)
         self._hass = hass
         self._node_id = str(node_id).replace(":", "").lower()
         self._device_name = device_name
-        self._device_info = device_info
 
         # Entity attributes
         self._attr_has_entity_name = True

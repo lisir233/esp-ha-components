@@ -69,14 +69,10 @@ async def async_setup_entry(
             entity_key = f"{event_node_id}_light"
 
             if entity_key not in discovered_entities:
-                device_info = {
-                    "node_id": event_node_id,
-                    "name": device_name or f"ESP {event_node_id}",
-                }
-
                 light_entity = ESPHomeLight(
                     api=api,
-                    device_info=device_info,
+                    node_id=event_node_id,
+                    device_name=device_name or f"ESP-{event_node_id}",
                     light_name=device_name,
                     light_params=light_params,
                     is_discovery=True,
@@ -107,29 +103,27 @@ class ESPHomeLight(LightEntity):
     def __init__(
         self,
         api: Any,
-        device_info: dict,
+        node_id: str,
+        device_name: str,
         light_name: str,
         light_params: dict | None = None,
         is_discovery: bool = False,
     ) -> None:
         """Initialize the light entity."""
         self._api = api
-        self._device_info = device_info
+        self._node_id = str(node_id).replace(":", "").lower()
+        self._device_name = device_name
         self._light_name = light_name
         self._is_discovery = is_discovery
-
-        node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
 
         self._attr_name = "Light"
         self._attr_has_entity_name = True
         if is_discovery:
-            self._attr_unique_id = f"{DOMAIN}_{node_id}_light"
+            self._attr_unique_id = f"{DOMAIN}_{self._node_id}_light"
         else:
-            self._attr_unique_id = f"{DOMAIN}_{node_id}_light_legacy"
+            self._attr_unique_id = f"{DOMAIN}_{self._node_id}_light_legacy"
 
-        self._attr_device_info = get_device_info(
-            device_info["node_id"], device_info["name"]
-        )
+        self._attr_device_info = get_device_info(self._node_id, device_name)
 
         self._attr_is_on = False
         self._attr_brightness = 255
@@ -166,8 +160,7 @@ class ESPHomeLight(LightEntity):
     @property
     def available(self) -> bool:
         """Return True if entity is available (device is connected)."""
-        node_id = str(self._device_info["node_id"]).lower()
-        return self._api.is_device_available(node_id)
+        return self._api.is_device_available(self._node_id)
 
     @property
     def extra_state_attributes(self) -> dict[str, any]:
@@ -202,13 +195,12 @@ class ESPHomeLight(LightEntity):
         """Handle device availability change - update entity state."""
         try:
             event_node_id = str(event.data.get("node_id", "")).replace(":", "").lower()
-            device_node_id = str(self._device_info["node_id"]).replace(":", "").lower()
 
-            if event_node_id == device_node_id:
+            if event_node_id == self._node_id:
                 available = event.data.get("available", False)
                 _LOGGER.debug(
                     "Device %s availability changed to %s, updating light %s",
-                    device_node_id,
+                    self._node_id,
                     "available" if available else "unavailable",
                     self._attr_unique_id,
                 )
@@ -224,9 +216,8 @@ class ESPHomeLight(LightEntity):
         """Handle light state updates."""
         try:
             event_id = str(event.data.get("node_id", "")).replace(":", "").lower()
-            device_id = str(self._device_info["node_id"]).replace(":", "").lower()
 
-            if event_id != device_id:
+            if event_id != self._node_id:
                 return
 
             light_data = event.data.get("light_data", {})
@@ -299,12 +290,10 @@ class ESPHomeLight(LightEntity):
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn on light using ESP-RainMaker local control."""
-        node_id = str(self._device_info["node_id"]).lower()
-
         try:
             # First ensure the light is powered on
             if not await self._set_property("Power", True):
-                _LOGGER.error("Failed to turn on light: %s", node_id)
+                _LOGGER.error("Failed to turn on light: %s", self._node_id)
                 return
 
             self._attr_is_on = True
@@ -346,20 +335,20 @@ class ESPHomeLight(LightEntity):
             self.async_write_ha_state()
 
         except Exception:
-            _LOGGER.exception("Failed to turn on light %s", node_id)
+            _LOGGER.exception("Failed to turn on light %s", self._node_id)
 
     async def _set_property(self, property_name: str, value: Any) -> bool:
         """Set a property on the device with error handling."""
         try:
             success = await self._api.set_local_ctrl_property(
-                self._device_info["node_id"], property_name, value
+                self._node_id, property_name, value
             )
         except Exception:
             _LOGGER.exception(
                 "Error setting property %s=%s for %s",
                 property_name,
                 value,
-                self._device_info["node_id"],
+                self._node_id,
             )
             return False
         else:
@@ -368,14 +357,14 @@ class ESPHomeLight(LightEntity):
                     "Property set successfully: %s=%s for %s",
                     property_name,
                     value,
-                    self._device_info["node_id"],
+                    self._node_id,
                 )
             else:
                 _LOGGER.warning(
                     "Failed to set property: %s=%s for %s",
                     property_name,
                     value,
-                    self._device_info["node_id"],
+                    self._node_id,
                 )
             return success
 
@@ -387,13 +376,13 @@ class ESPHomeLight(LightEntity):
                 self.async_write_ha_state()
             else:
                 _LOGGER.warning(
-                    "Failed to turn off light: %s", self._device_info["node_id"]
+                    "Failed to turn off light: %s", self._node_id
                 )
 
         except Exception:
             _LOGGER.exception(
                 "Error turning off light %s",
-                self._device_info["node_id"],
+                self._node_id,
             )
 
     async def async_update(self) -> None:

@@ -188,7 +188,7 @@ class ESPDeviceParser:
             )
         else:
             device_name = info.get(
-                "name", f"ESP {node_id}" if node_id else "ESP Device"
+                "name", f"ESP-{node_id}" if node_id else "ESP Device"
             )
 
         # Create standardized device info to ensure all entities belong to same device

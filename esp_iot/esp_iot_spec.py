@@ -572,7 +572,7 @@ def add_sensor_platform(device_config: dict) -> None:
 
     for sensor_key, name, unit, device_class in sensor_types:
         sensor_config = {
-            "device_name": f"ESP {name}",
+            "device_name": f"ESP-{name}",
             "sensor_type": sensor_key,
             "sensor_name": f"esp_{sensor_key}",
             "param": {"name": name, "type": "float"},

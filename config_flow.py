@@ -75,7 +75,12 @@ class ESPHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             if device["node_id"] in existing_node_ids:
                 continue
 
-            name = device.get("name", f"ESP {device['node_id']}")
+            # Use device_name if available, otherwise use "ESP-{node_id}" format
+            if device.get("device_name"):
+                name = device["device_name"]
+            else:
+                name = f"ESP-{device['node_id']}"
+            
             self._available_devices.append({
                 "ip": device["ip"],
                 "node_id": device["node_id"],
@@ -203,7 +208,7 @@ class ESPHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(node_id)
         self._abort_if_unique_id_configured()
 
-        title = self._selected_device.get("name", f"ESP {node_id}")
+        title = self._selected_device.get("name", f"ESP-{node_id}")
 
         config_data = {
             CONF_HOST: self._selected_device["ip"],

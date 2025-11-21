@@ -25,12 +25,12 @@ class ESPHomeIMUGesture(SensorEntity):
         self,
         hass: HomeAssistant,
         api: Any,
-        device_info: dict[str, Any],
-        device_name: str,
         node_id: str,
+        device_name: str,
     ) -> None:
         """Initialize the IMU gesture sensor."""
         self._hass = hass
+        self._api = api
         self._node_id = str(node_id).replace(":", "").lower()
         self._device_name = device_name
 

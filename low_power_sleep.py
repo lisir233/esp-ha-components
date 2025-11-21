@@ -22,14 +22,12 @@ class ESPHomeLowPowerSleep(SensorEntity):
         hass: HomeAssistant,
         node_id: str,
         device_name: str,
-        device_info: dict[str, Any],
     ) -> None:
         """Initialize the Low Power & Sleep entity."""
         SensorEntity.__init__(self)
         self._hass = hass
         self._node_id = str(node_id).replace(":", "").lower()
         self._device_name = device_name
-        self._device_info = device_info
 
         # Entity attributes
         self._attr_has_entity_name = True
@@ -90,7 +88,7 @@ class ESPHomeLowPowerSleep(SensorEntity):
                 available = event.data.get("available", False)
                 _LOGGER.debug(
                     "Device %s availability changed to %s, updating sleep entity %s",
-                    self._device_info.get("name"),
+                    self._device_name,
                     "available" if available else "unavailable",
                     self._attr_unique_id if hasattr(self, '_attr_unique_id') else 'unknown',
                 )

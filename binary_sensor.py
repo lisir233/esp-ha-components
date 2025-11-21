@@ -77,12 +77,8 @@ async def async_setup_entry(
             discovered_sensors.add(sensor_key)
             hass.data[DOMAIN][discovered_key] = discovered_sensors
 
-            device_info_data = event.data.get("device_info", {})
-            if not device_info_data or "node_id" not in device_info_data:
-                device_info_data = {
-                    "node_id": event_node_id,
-                    "name": event.data.get("device_name", f"ESP {event_node_id}"),
-                }
+            # Get device name from event or use default format
+            device_name = event.data.get("device_name", f"ESP-{event_node_id}")
 
             # Get sensor name from params or use generic name
             params = event.data.get("params", {})
@@ -98,7 +94,8 @@ async def async_setup_entry(
             # Create and add binary sensor
             binary_sensor = ESPHomeBinarySensor(
                 hass=hass,
-                device_info=device_info_data,
+                node_id=event_node_id,
+                device_name=device_name,
                 sensor_name=sensor_name,
                 sensor_params=event.data.get("params", {}),
             )
@@ -124,17 +121,19 @@ class ESPHomeBinarySensor(BinarySensorEntity):
     def __init__(
         self,
         hass: HomeAssistant,
-        device_info: dict[str, Any],
+        node_id: str,
+        device_name: str,
         sensor_name: str,
         sensor_params: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the binary sensor entity."""
         self.hass = hass
         self._params = sensor_params or {}
+        self._node_id = str(node_id).replace(":", "").lower()
+        self._device_name = device_name
 
         # Generate unique ID (one binary sensor per device)
-        device_node_id = str(device_info.get("node_id", "")).replace(":", "").lower()
-        self._attr_unique_id = f"{DOMAIN}_{device_node_id}_binary_sensor"
+        self._attr_unique_id = f"{DOMAIN}_{self._node_id}_binary_sensor"
 
         # Entity attributes
         self._attr_name = "Binary Sensor"
@@ -153,16 +152,11 @@ class ESPHomeBinarySensor(BinarySensorEntity):
         )
 
         # Device info
-        self._attr_device_info = get_device_info(
-            device_info["node_id"], device_info["name"]
-        )
+        self._attr_device_info = get_device_info(self._node_id, device_name)
 
         # Core attributes
         self._binary_sensor_type = device_class_normalized
         self._attr_extra_state_attributes = {}
-
-        # Store node_id for availability check
-        self._node_id = device_node_id
 
         _LOGGER.debug(
             "Initialized binary sensor: %s (ID: %s, Type: %s)",

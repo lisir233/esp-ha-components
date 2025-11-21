@@ -47,7 +47,7 @@ def get_device_info(
     Args:
         node_id: Unique identifier for the device. Required.
         device_name: Optional device name. If not provided, generates
-            name as "ESP {last_4_chars_of_node_id}".
+            name as "ESP-{node_id}".
         ip_address: Optional IP address. If provided, adds configuration
             URL to device info.
         hw_version: Hardware version string. Defaults to DEVICE_HW_VERSION.
@@ -75,7 +75,7 @@ def get_device_info(
     node_id_clean = str(node_id).replace(":", "").lower()
 
     # Create device name if not provided - use complete node_id
-    name = device_name or f"ESP {node_id_clean}"
+    name = device_name or f"ESP-{node_id_clean}"
 
     # Build device info with required fields
     info: dict[str, Any] = {

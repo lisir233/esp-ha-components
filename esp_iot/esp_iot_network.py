@@ -195,8 +195,8 @@ class ESPDeviceListener:
 
             _LOGGER.debug("Service %s: %s", change_type, name)
 
-            # Extract node ID from service name or properties
-            node_id = self._extract_node_id(name, info)
+            # Extract node ID and device name from service properties
+            node_id, device_name = self._extract_device_info(name, info)
             if not node_id:
                 _LOGGER.error("Discovered device without node ID: %s", name)
                 return
@@ -205,8 +205,9 @@ class ESPDeviceListener:
             port = info.port  # Extract port from zeroconf service info
 
             _LOGGER.info(
-                "📝 Extracted device info: node_id=%s, ip=%s, port=%s",
+                "📝 Extracted device info: node_id=%s, device_name=%s, ip=%s, port=%s",
                 node_id,
+                device_name,
                 ip,
                 port,
             )
@@ -214,13 +215,13 @@ class ESPDeviceListener:
             if change_type == "removed":
                 self._process_device_removal(node_id)
             else:
-                self._process_device_discovery(node_id, ip, change_type, port)
+                self._process_device_discovery(node_id, ip, change_type, port, device_name)
 
         except Exception:
             _LOGGER.exception("Error handling service %s", change_type)
 
     def _process_device_discovery(
-        self, node_id: str, ip: str, change_type: str, port: int | None = None
+        self, node_id: str, ip: str, change_type: str, port: int | None = None, device_name: str | None = None
     ) -> None:
         """Process device discovery or update.
 
@@ -232,13 +233,15 @@ class ESPDeviceListener:
             ip: Device IP address.
             change_type: Type of change ("added" or "updated").
             port: Device port. Defaults to 8080 if None.
+            device_name: Custom device name from mDNS TXT. Defaults to None.
         """
         if port is None:
             port = 8080  # Default port
 
         _LOGGER.info(
-            "🔍 _process_device_discovery called: node_id=%s, ip=%s, port=%s, change_type=%s, api=%s",
+            "🔍 _process_device_discovery called: node_id=%s, device_name=%s, ip=%s, port=%s, change_type=%s, api=%s",
             node_id,
+            device_name,
             ip,
             port,
             change_type,
@@ -248,15 +251,16 @@ class ESPDeviceListener:
         if self.api is None:
             # Config flow discovery - allow all devices to be discovered
             _LOGGER.debug(
-                "Discovered device (config flow): Node ID=%s IP=%s Port=%s Change=%s",
+                "Discovered device (config flow): Node ID=%s Device Name=%s IP=%s Port=%s Change=%s",
                 node_id,
+                device_name,
                 ip,
                 port,
                 change_type,
             )
             self.hass.loop.call_soon_threadsafe(
                 self.hass.async_create_task,
-                self._async_handle_discovery(node_id, ip, port),
+                self._async_handle_discovery(node_id, ip, port, device_name),
             )
         else:
             # Service discovery - only process devices with existing config entries
@@ -315,7 +319,7 @@ class ESPDeviceListener:
             )
 
     async def _async_handle_discovery(
-        self, node_id: str, ip: str, port: int | None = None
+        self, node_id: str, ip: str, port: int | None = None, device_name: str | None = None
     ) -> None:
         """Handle new device discovery.
 
@@ -325,6 +329,7 @@ class ESPDeviceListener:
             node_id: Device node ID.
             ip: Device IP address.
             port: Device port. Defaults to 8080 if None.
+            device_name: Custom device name from mDNS TXT. Defaults to None.
         """
         if port is None:
             port = 8080  # Default port
@@ -348,9 +353,10 @@ class ESPDeviceListener:
                     "node_id": node_id,
                     "ip": ip,
                     "port": port,
+                    "device_name": device_name,
                 }
                 self.devices.append(device_info)
-                _LOGGER.debug("New device discovered: Node ID=%s IP=%s", node_id, ip)
+                _LOGGER.debug("New device discovered: Node ID=%s Device Name=%s IP=%s", node_id, device_name, ip)
 
             if not self.discovered_event.is_set():
                 self.discovered_event.set()
@@ -369,24 +375,37 @@ class ESPDeviceListener:
                 self.devices = [d for d in self.devices if d["node_id"] != node_id]
                 _LOGGER.debug("Device removed: Node ID=%s", node_id)
 
-    def _extract_node_id(
+    def _extract_device_info(
         self, service_name: str, service_info: ServiceInfo | None
-    ) -> str | None:
-        """Extract node ID from service name or properties.
+    ) -> tuple[str | None, str | None]:
+        """Extract node ID and device name from service properties.
 
-        Tries multiple methods to extract a valid node ID:
-        1. Check service properties for node_id/device_id/id
-        2. Extract from service name
-        3. Extract from server name
+        Tries multiple methods to extract device information:
+        1. Check service properties for node_id (required for communication)
+        2. Check service properties for device_name (optional, for display)
+        3. Extract node_id from service name
+        4. Extract node_id from server name
 
         Args:
             service_name: Zeroconf service name.
             service_info: Zeroconf service info object.
 
         Returns:
-            Formatted node ID string, or None if no valid ID found.
+            Tuple of (node_id, device_name). device_name may be None.
         """
-        # Method 1: Check service properties for node ID
+        node_id = None
+        device_name = None
+        
+        # Extract device_name if present (for display only)
+        if service_info and service_info.properties:
+            if b"device_name" in service_info.properties:
+                device_name = service_info.properties[b"device_name"].decode("utf-8")
+                _LOGGER.info(
+                    "Found device_name in mDNS TXT: %s (will be used for display)",
+                    device_name,
+                )
+        
+        # Method 1: Check service properties for node ID (required for communication)
         if service_info and service_info.properties:
             # Get node_id from properties
             id_keys = ["node_id", "device_id", "id"]
@@ -395,15 +414,20 @@ class ESPDeviceListener:
                     id_value = service_info.properties[key.encode()].decode("utf-8")
                     # Validate and format node_id
                     if self._is_valid_node_id(id_value):
-                        return self._format_node_id(id_value)
+                        node_id = self._format_node_id(id_value)
+                        break
+        
+        # If node_id found, return it with device_name
+        if node_id:
+            return (node_id, device_name)
 
         # Method 2: Extract from service name
         if service_name:
             # Remove service type suffix
-            device_name = service_name.split(".")[0]
+            extracted_name = service_name.split(".")[0]
             # Validate if it's a valid node_id
-            if self._is_valid_node_id(device_name):
-                return self._format_node_id(device_name)
+            if self._is_valid_node_id(extracted_name):
+                return (self._format_node_id(extracted_name), device_name)
 
         # Method 3: Extract from server name
         if service_info and hasattr(service_info, "server"):
@@ -412,9 +436,9 @@ class ESPDeviceListener:
                 # Try to extract valid node_id from server name
                 parts = server_name.split(".")
                 if parts and self._is_valid_node_id(parts[0]):
-                    return self._format_node_id(parts[0])
+                    return (self._format_node_id(parts[0]), device_name)
 
-        return None
+        return (None, None)
 
     def _is_valid_node_id(self, node_id_str: str) -> bool:
         """Check if string is a valid node ID format.
